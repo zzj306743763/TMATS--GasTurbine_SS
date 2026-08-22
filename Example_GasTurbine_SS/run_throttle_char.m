@@ -9,10 +9,12 @@ function results = run_throttle_char(varargin)
 %
 %  扫描顺序（几何与 iDesign 始终冻结）：
 %    1) 先跑通设计点 3.00 pps
-%    2) 用 3.00 的收敛解单独往上探 3.05 pps
-%    3) 回到 3.00 的收敛解，按 0.1 pps 减到 1.80 pps
-%    4) 若 1.80 仍收敛，再按 0.05 pps 往下，直到不收敛
-%    任一步不收敛：在上一点与失败点之间对分；步长小于 dWfMin 则停止下行
+%    2) 从 3.00 按 0.1 pps 减到 1.80 pps
+%    3) 若 1.80 仍收敛，再按 0.05 pps 往下，直到不收敛或碰到 WfMinAbs
+%    任一步不收敛：在上一点与失败点之间对分；步长小于 dWfMin 则停止
+%  注意：单轴涡喷在大状态附近 Wf 降得快、N 降得慢。默认燃油下限 0.15 pps，
+%  不要把它理解成“算到 NcMap=0.5”。图横轴 0.5～1.05 是特性图范围，不是已算到的范围。
+%  图：NcMap–Fn / NcMap–SFC，SFC–总推力，以及 Wf / SM / T4 / R-line 诊断图。结果每次覆盖。
 %
 %  每一档用上一档收敛的 [W; Rline; 涡轮PR; N] 作为 NR 初值。
 %  退出时恢复燃油和 NR_IC，并删除本次临时加上的记录模块；不要保存官方 mdl。
@@ -20,18 +22,16 @@ function results = run_throttle_char(varargin)
     p = inputParser;
     addParameter(p, 'Model', 'GasTurbine_SS_Template', @ischar);
     addParameter(p, 'WfDes', 3.00, @isnumeric);
-    addParameter(p, 'WfUp', 3.05, @isnumeric);
     addParameter(p, 'WfCoarseEnd', 1.80, @isnumeric);
     addParameter(p, 'dWfCoarse', 0.10, @isnumeric);
     addParameter(p, 'dWfFine', 0.05, @isnumeric);
     addParameter(p, 'dWfMin', 0.01, @isnumeric);
-    addParameter(p, 'WfMinAbs', 0.50, @isnumeric);
+    addParameter(p, 'WfMinAbs', 0.15, @isnumeric);
     addParameter(p, 'SaveFig', true, @islogical);
     parse(p, varargin{:});
 
     mdl = p.Results.Model;
     WfDes = p.Results.WfDes;
-    WfUp = p.Results.WfUp;
     WfCoarseEnd = p.Results.WfCoarseEnd;
     dWfCoarse = p.Results.dWfCoarse;
     dWfFine = p.Results.dWfFine;
@@ -56,14 +56,16 @@ function results = run_throttle_char(varargin)
     solverBlk = [mdl '/SS NR Solver w JacobianCalc'];
     Wf0_str   = get_param(wfBlk, 'Value');
     added_blocks = ensure_throttle_logs(mdl); %#ok<NASGU>
-    cleanupObj = onCleanup(@() cleanup_all()); %#ok<NASGU>
+    cu = struct('mdl', mdl, 'wfBlk', wfBlk, 'solverBlk', solverBlk, ...
+        'NR_IC0', NR_IC0, 'Wf0_str', Wf0_str);
+    cleanupObj = onCleanup(@() restore_throttle_cleanup(cu)); %#ok<NASGU>
 
     results = empty_results();
     x_next = NR_IC0;
 
     fprintf('\n=== 地面节流扫描 (H=0, MN=0, iDesign=2) ===\n');
-    fprintf('%6s  %8s  %8s  %10s  %8s  %s\n', ...
-        'Wf', 'N', 'Fn', 'SFC', 'SM', 'status');
+    fprintf('%6s  %8s  %10s  %8s  %10s  %8s  %s\n', ...
+        'Wf', 'N', 'NcMap', 'Fn', 'SFC', 'SM', 'status');
 
     % --- 1) 设计点 ---
     fprintf('-- 1) 设计点 %.2f pps --\n', WfDes);
@@ -72,40 +74,47 @@ function results = run_throttle_char(varargin)
         error('设计点 %.2f pps 未收敛，停止扫描。', WfDes);
     end
 
-    % --- 2) 单独往上探，探完仍用设计点解往下走 ---
-    fprintf('-- 2) 往上探 %.2f pps（初值来自 %.2f）--\n', WfUp, WfDes);
-    [results, ~, okUp] = run_and_store(results, WfUp, x_des);
-    if ~okUp
-        fprintf('    往上探未收敛，设计点已靠近高端。\n');
-    end
-    x_next = x_des;
-    Wf_ok = WfDes;
-
-    % --- 3) 从设计点按 0.1 pps 走向 1.80；失败则对分 ---
-    fprintf('-- 3) 从 %.2f 按 %.2f pps 走向 %.2f，失败则对分 --\n', ...
+    % --- 2) 从设计点按 0.1 pps 走向 1.80；失败则对分 ---
+    fprintf('-- 2) 从 %.2f 按 %.2f pps 减到 %.2f，失败则对分 --\n', ...
         WfDes, dWfCoarse, WfCoarseEnd);
     [results, x_next, Wf_ok, reached_1p80] = sweep_down( ...
-        results, Wf_ok, x_next, dWfCoarse, WfCoarseEnd, false, dWfMin);
+        results, WfDes, x_des, dWfCoarse, WfCoarseEnd, false, dWfMin);
 
-    % --- 4) 到达 1.80 后再按 0.05 pps 往下直到对分也无法前进 ---
+    % --- 3) 到达 1.80 后再按 0.05 pps 往下直到对分也无法前进 ---
     if reached_1p80
-        fprintf('-- 4) 已到达 %.2f pps，改 %.2f pps 继续往下 --\n', ...
+        fprintf('-- 3) 已到达 %.2f pps，改 %.2f pps 继续往下 --\n', ...
             WfCoarseEnd, dWfFine);
         [results, ~, Wf_ok] = sweep_down( ...
             results, Wf_ok, x_next, dWfFine, WfMinAbs, true, dWfMin);
         fprintf('    下行结束，最后成功点 Wf = %.2f pps。\n', Wf_ok);
     else
-        fprintf('-- 4) 未能收敛到 %.2f pps，最后成功点 Wf = %.2f，不再进入 0.05 段。\n', ...
+        fprintf('-- 3) 未能收敛到 %.2f pps，最后成功点 Wf = %.2f，不再进入 0.05 段。\n', ...
             WfCoarseEnd, Wf_ok);
     end
 
+    print_scan_summary(results, WfMinAbs);
+
     outdir = fileparts(mfilename('fullpath'));
-    save(fullfile(outdir, 'throttle_char_results.mat'), 'results');
-    plot_throttle(results);
-    if p.Results.SaveFig
-        figfile = fullfile(outdir, 'throttle_char.png');
-        saveas(gcf, figfile);
-        fprintf('图已保存: %s\n', figfile);
+    matfile = fullfile(outdir, 'throttle_char_results.mat');
+    figNc   = fullfile(outdir, 'throttle_char.png');
+    figSFC  = fullfile(outdir, 'throttle_char_sfc_vs_fn.png');
+    figOps  = fullfile(outdir, 'throttle_char_ops.png');
+    overwrite_file(matfile);
+    save(matfile, 'results');
+    fprintf('数据已覆盖保存: %s\n', matfile);
+
+    hFigs = plot_throttle(results);
+    if p.Results.SaveFig && ~isempty(hFigs)
+        overwrite_file(figNc);
+        overwrite_file(figSFC);
+        saveas(hFigs(1), figNc);
+        saveas(hFigs(2), figSFC);
+        fprintf('图已覆盖保存:\n  %s\n  %s\n', figNc, figSFC);
+        if numel(hFigs) >= 3
+            overwrite_file(figOps);
+            saveas(hFigs(3), figOps);
+            fprintf('  %s\n', figOps);
+        end
     end
 
     function [res, x_out, Wf_out, reached] = sweep_down(res, Wf_ok1, x_ok, dNom, Wf_bound, until_fail, dMin)
@@ -165,8 +174,9 @@ function results = run_throttle_char(varargin)
         else
             flag = 'NOT CONVERGED';
         end
-        fprintf('%6.2f  %8.1f  %8.1f  %10.4f  %8.2f  %s\n', ...
-            row.Wf_pps, row.N_rpm, row.Fn_lbf, row.SFC_pph_lbf, row.SM_pct, flag);
+        fprintf('%6.2f  %8.1f  %10.4f  %8.1f  %10.4f  %8.2f  %s\n', ...
+            row.Wf_pps, row.N_rpm, row.NcMap, row.Fn_lbf, row.SFC_pph_lbf, ...
+            row.SM_pct, flag);
     end
 
     function [row, x_out, ok] = run_one_point(Wf, x_ic)
@@ -213,6 +223,13 @@ function results = run_throttle_char(varargin)
             row.PR_comp  = last_num(Cdat, 'PR');
             row.SM_pct   = last_num(Cdat, 'SMavail');
             row.Nc       = last_num(Cdat, 'Nc');
+            row.NcMap    = last_num(Cdat, 'NcMap');
+            if ~isfinite(row.NcMap)
+                sNc = last_num(Cdat, 's_C_Nc');
+                if isfinite(sNc) && sNc ~= 0 && isfinite(row.Nc)
+                    row.NcMap = row.Nc / sNc;
+                end
+            end
             row.Tt4_R    = last_num(s4, 'Tt');
             if ok
                 x_out = x(:);
@@ -224,21 +241,24 @@ function results = run_throttle_char(varargin)
             ok = false;
         end
     end
+end
 
-    function cleanup_all()
-        try
-            MWS.Solve.NR_IC = NR_IC0;
-            assignin('base', 'MWS', MWS);
-            if bdIsLoaded(mdl)
-                set_param(wfBlk, 'Value', Wf0_str);
-                set_param(solverBlk, 'SNR_IC_M', 'MWS.Solve.NR_IC');
-                remove_throttle_logs(mdl);
-            end
-            fprintf(['已恢复燃油与 NR_IC，并删除临时记录模块。', ...
-                '请不要保存 GasTurbine_SS_Template.mdl。\n']);
-        catch ME
-            warning('THROTTLE:Cleanup', '退出清理未完全成功: %s', ME.message);
+function restore_throttle_cleanup(cu)
+    try
+        if evalin('base', 'exist(''MWS'',''var'')') == 1
+            MWSb = evalin('base', 'MWS');
+            MWSb.Solve.NR_IC = cu.NR_IC0;
+            assignin('base', 'MWS', MWSb);
         end
+        if bdIsLoaded(cu.mdl)
+            set_param(cu.wfBlk, 'Value', cu.Wf0_str);
+            set_param(cu.solverBlk, 'SNR_IC_M', 'MWS.Solve.NR_IC');
+            remove_throttle_logs(cu.mdl);
+        end
+        fprintf(['已恢复燃油与 NR_IC，并删除临时记录模块。', ...
+            '请不要保存 GasTurbine_SS_Template.mdl。\n']);
+    catch ME
+        warning('THROTTLE:Cleanup', '退出清理未完全成功: %s', ME.message);
     end
 end
 
@@ -246,7 +266,7 @@ function r = empty_results()
     r = struct('Wf_pps', [], 'Wf_kgs', [], 'N_rpm', [], 'Fn_lbf', [], ...
         'Fn_N', [], 'SFC_pph_lbf', [], 'SFC_kgN_s', [], 'W_pps', [], ...
         'Rline', [], 'PR_turb', [], 'PR_comp', [], 'SM_pct', [], ...
-        'Nc', [], 'Tt4_R', [], 'converged', false(0, 1), 'NR_X', zeros(0, 4));
+        'Nc', [], 'NcMap', [], 'Tt4_R', [], 'converged', false(0, 1), 'NR_X', zeros(0, 4));
 end
 
 function row = blank_row(Wf)
@@ -263,6 +283,7 @@ function row = blank_row(Wf)
     row.PR_comp = nan;
     row.SM_pct = nan;
     row.Nc = nan;
+    row.NcMap = nan;
     row.Tt4_R = nan;
     row.converged = false;
     row.NR_X = nan(1, 4);
@@ -282,6 +303,7 @@ function r = append_result(r, row)
     r.PR_comp(end+1, 1) = row.PR_comp;
     r.SM_pct(end+1, 1) = row.SM_pct;
     r.Nc(end+1, 1) = row.Nc;
+    r.NcMap(end+1, 1) = row.NcMap;
     r.Tt4_R(end+1, 1) = row.Tt4_R;
     r.converged(end+1, 1) = row.converged;
     r.NR_X(end+1, :) = row.NR_X;
@@ -548,32 +570,147 @@ function d = ts_data(ts)
     end
 end
 
-function plot_throttle(results)
+function overwrite_file(fpath)
+    if exist(fpath, 'file')
+        delete(fpath);
+    end
+end
+
+function print_scan_summary(results, WfMinAbs)
     ok = results.converged;
+    nAll = numel(results.Wf_pps);
+    nOk = nnz(ok);
+    fprintf('\n=== 扫描小结 ===\n');
+    fprintf('收敛 %d / %d 点。\n', nOk, nAll);
+    if nOk < 1
+        return
+    end
+    [ncMin, k] = min(results.NcMap(ok));
+    idx = find(ok);
+    i = idx(k);
+    [sfcMin, kS] = min(results.SFC_pph_lbf(ok));
+    j = idx(kS);
+    fprintf(['最低 NcMap = %.4f  （N = %.1f rpm，Wf = %.2f pps，', ...
+        'SM = %.1f %%，Rline = %.3f）\n'], ...
+        ncMin, results.N_rpm(i), results.Wf_pps(i), ...
+        results.SM_pct(i), results.Rline(i));
+    fprintf('最低 SFC = %.4f，出现在 NcMap = %.4f，Fn = %.1f lbf\n', ...
+        sfcMin, results.NcMap(j), results.Fn_lbf(j));
+    hitFloor = results.converged(i) && (results.Wf_pps(i) <= WfMinAbs + 1e-6);
+    if nOk == nAll && hitFloor
+        fprintf(['停止原因：碰到脚本燃油下限 %.2f pps，这一档仍然收敛。', ...
+            '不是牛顿法失败，也不是喘振（当前 SM = %.1f %%）。\n', ...
+            '大状态附近燃油降得快、转速降得慢；要看到 NcMap=0.8，需要继续减油。\n'], ...
+            WfMinAbs, results.SM_pct(i));
+    elseif nOk < nAll
+        fprintf(['停止原因：Wf = %.2f pps 未能收敛，上一成功点 Wf = %.2f pps。\n'], ...
+            results.Wf_pps(find(~ok, 1, 'last')), results.Wf_pps(i));
+    end
+end
+
+function hFigs = plot_throttle(results)
+    ok = results.converged;
+    hFigs = gobjects(0);
     if ~any(ok)
         warning('THROTTLE:NoPoints', '没有收敛点，无法画节流特性。');
         return
     end
-    N = results.N_rpm(ok);
+    NcMap = results.NcMap(ok);
     Fn = results.Fn_lbf(ok);
     sfc = results.SFC_pph_lbf(ok);
-    [N, idx] = sort(N);
+    Wf = results.Wf_pps(ok);
+    SM = results.SM_pct(ok);
+    Rl = results.Rline(ok);
+    T4K = results.Tt4_R(ok) * 5/9;
+    if all(~isfinite(NcMap)) && any(isfinite(results.Nc(ok)))
+        % 旧结果只有 Nc[rpm] 时：本机 s_Nc=10000，NcMap = Nc/s_Nc
+        NcMap = results.Nc(ok) / 10000;
+    end
+    if all(~isfinite(NcMap))
+        warning('THROTTLE:NoNcMap', '压气机图换算转速 NcMap 无效，无法按 0.5～1.05 作图。');
+        return
+    end
+    xlab = 'N_{c,map}  [-]';
+    tNc = '压气机换算转速';
+    [NcMap, idx] = sort(NcMap);
     Fn = Fn(idx);
     sfc = sfc(idx);
+    Wf = Wf(idx);
+    SM = SM(idx);
+    Rl = Rl(idx);
+    T4K = T4K(idx);
+    [sfcMin, iS] = min(sfc);
+    xmax = max(1.05, max(NcMap));
+    note = sprintf('已算 NcMap = %.3f～%.3f（横轴 0.50～1.05 是特性图范围）', ...
+        min(NcMap), max(NcMap));
 
-    figure('Name', 'Throttle characteristic', 'Color', 'w');
+    h1 = figure('Name', 'Throttle vs NcMap', 'Color', 'w');
 
     subplot(1, 2, 1);
-    plot(N, Fn, 'o-', 'LineWidth', 1.5);
+    plot(NcMap, Fn, 'o-', 'LineWidth', 1.5);
     grid on
-    xlabel('N  [rpm]');
+    xlabel(xlab);
     ylabel('F_n  [lbf]');
-    title('地面节流特性（推力）');
+    xlim([0.5 xmax]);
+    title(['地面节流特性（推力–' tNc '）']);
 
     subplot(1, 2, 2);
-    plot(N, sfc, 'o-', 'LineWidth', 1.5);
+    plot(NcMap, sfc, 'o-', 'LineWidth', 1.5);
+    hold on
+    plot(NcMap(iS), sfcMin, 'rd', 'MarkerSize', 8, 'LineWidth', 1.2);
     grid on
-    xlabel('N  [rpm]');
+    xlabel(xlab);
     ylabel('SFC  [lbm/h/lbf]');
-    title('地面节流特性（耗油率）');
+    xlim([0.5 xmax]);
+    title(['地面节流特性（耗油率–' tNc '）']);
+    legend({'SFC', sprintf('最低 SFC = %.3f', sfcMin)}, 'Location', 'northwest');
+    annotation('textbox', [0.12 0.01 0.76 0.05], 'String', note, ...
+        'EdgeColor', 'none', 'HorizontalAlignment', 'center', 'FontSize', 8);
+
+    [Fn2, idx2] = sort(Fn);
+    sfc2 = sfc(idx2);
+    h2 = figure('Name', 'SFC vs thrust', 'Color', 'w');
+    plot(Fn2, sfc2, 'o-', 'LineWidth', 1.5);
+    hold on
+    plot(Fn(iS), sfcMin, 'rd', 'MarkerSize', 8, 'LineWidth', 1.2);
+    grid on
+    xlabel('F_n  [lbf]  （总推力）');
+    ylabel('SFC  [lbm/h/lbf]');
+    title('地面节流特性（耗油率–总推力）');
+    legend({'SFC', sprintf('最低 SFC = %.3f', sfcMin)}, 'Location', 'northwest');
+
+    h3 = figure('Name', 'Throttle operating line', 'Color', 'w');
+    subplot(2, 2, 1);
+    plot(NcMap, Wf, 'o-', 'LineWidth', 1.5);
+    grid on
+    xlabel(xlab);
+    ylabel('W_f  [pps]');
+    xlim([0.5 xmax]);
+    title('燃油–换算转速（大状态附近很陡）');
+
+    subplot(2, 2, 2);
+    plot(NcMap, SM, 'o-', 'LineWidth', 1.5);
+    grid on
+    xlabel(xlab);
+    ylabel('SM  [%]');
+    xlim([0.5 xmax]);
+    title('压气机喘振裕度');
+
+    subplot(2, 2, 3);
+    plot(NcMap, T4K, 'o-', 'LineWidth', 1.5);
+    grid on
+    xlabel(xlab);
+    ylabel('T_4  [K]');
+    xlim([0.5 xmax]);
+    title('涡轮前温度');
+
+    subplot(2, 2, 4);
+    plot(NcMap, Rl, 'o-', 'LineWidth', 1.5);
+    grid on
+    xlabel(xlab);
+    ylabel('R-line  [-]');
+    xlim([0.5 xmax]);
+    title('压气机 R-line（增大表示离开喘振线）');
+
+    hFigs = [h1, h2, h3];
 end
