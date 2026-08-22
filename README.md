@@ -1,6 +1,6 @@
 # T-MATS 单轴涡喷稳态示例
 
-本仓库存放 NASA [T-MATS](https://github.com/nasa/T-MATS) 官方单轴涡喷**稳态**示例 `GasTurbine_SS`，并附带地面节流特性扫描脚本。
+本仓库存放 NASA [T-MATS](https://github.com/nasa/T-MATS) 官方单轴涡喷**稳态**示例 `GasTurbine_SS`，并附带地面节流、高度特性和速度特性扫描脚本（后两者默认控制规律为涡轮前总温 \(T_4\) 不变）。
 
 完整说明、设计点和运行步骤见：
 

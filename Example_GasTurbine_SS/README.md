@@ -39,11 +39,11 @@ GasTurbine_SS_setup_everything
 
 结束后可调用 `GasTurbine_SS_Example_cleanup` 从路径里去掉本示例的 `SimSetup`。
 
-**不要把官方 mdl 存盘。** 节流脚本只会临时加记录模块，退出时会删掉。
+**不要把官方 mdl 存盘。** 特性扫描脚本只会临时加记录模块，退出时会删掉。
 
 ## 地面节流特性
 
-`run_throttle_char.m` 在 **H = 0、Ma = 0、几何冻结** 下扫燃油，求各平衡点的推力、耗油率、换算转速等。
+`run_throttle_char.m` 在 **H = 0、Ma = 0、几何冻结** 下扫燃油。图上用喷管**总推力（毛推力）** \(F_g\)；地面静止时冲压阻力为零，\(F_n=F_g\)。耗油率为 \(\mathrm{SFC}=3600 W_f/F_g\)。
 
 ```matlab
 % 先 setup，确认 Compressor / Turbine / Nozzle 的 iDesign = 2
@@ -53,8 +53,8 @@ results = run_throttle_char;
 默认从设计点 3.00 pps 往下收油，直到不收敛或碰到燃油下限。结果覆盖写入：
 
 - `throttle_char_results.mat`
-- `throttle_char.png` / `.fig`（推力、SFC 对压气机图换算转速 \(N_{c,\mathrm{map}}\)）
-- `throttle_char_sfc_vs_fn.png` / `.fig`（SFC 对总推力）
+- `throttle_char.png` / `.fig`（总推力 \(F_g\)、SFC 对压气机图换算转速 \(N_{c,\mathrm{map}}\)）
+- `throttle_char_sfc_vs_fg.png` / `.fig`（SFC 对总推力 \(F_g\)）
 - `throttle_char_ops.png` / `.fig`（燃油、喘振裕度、\(T_4\)、R-line）
 
 在 MATLAB 里请打开 **`.fig`**（当前文件夹双击，或 `openfig('throttle_char.fig')`）。png 方便插入文档。
@@ -67,6 +67,59 @@ results = run_throttle_char('PlotOnly', true);
 
 横轴 \(N_{c,\mathrm{map}}\) 按压气机特性图范围画成 **0.50～1.05**，与本次实际算到的转速区间不是一回事。
 
+## 飞行特性的控制规律
+
+速度特性和高度特性的默认控制规律都是 **涡轮前总温 \(T_4\) 不变**（取海平面静起飞设计点 \(W_f=3\) pps 的 \(T_4\)）。模型里燃油是常数、转速由牛顿法求出，所以每个飞行点会微调 \(W_f\) 去钉住 \(T_4\)。
+
+## 高度特性
+
+`run_altitude_char.m` 在 **几何冻结、Ma 固定、\(T_4\) 不变** 下扫高度。图上用喷管**总推力（毛推力）** \(F_g\)，不用净推力。四张子图为：单位推力 \(F_s=F_g/W\)、总推力 \(F_g\)、空气流量 \(W\)、耗油率 \(\mathrm{SFC}=3600 W_f/F_g\)。
+
+```matlab
+results = run_altitude_char;
+```
+
+默认 Ma = 0.9、\(T_4\) 保持设计点。海平面静止高度特性：
+
+```matlab
+results = run_altitude_char('MN', 0);
+```
+
+若要改成钉住换算转速或物理转速（不是教材默认）：
+
+```matlab
+results = run_altitude_char('ThrottleMode', 'NcMap');  % NcMap = 1
+results = run_altitude_char('ThrottleMode', 'N');      % N = 10000 rpm
+```
+
+钉死物理转速时，高空变冷后换算转速升高，本机压气机图大约只到 1.05，往往扫不高。
+
+结果覆盖写入 `altitude_char_results.mat`、`altitude_char.png` / `.fig`。只重画：
+
+```matlab
+results = run_altitude_char('PlotOnly', true);
+```
+
+## 速度特性
+
+`run_speed_char.m` 在 **几何冻结、高度固定、\(T_4\) 不变** 下扫马赫数。图同样是 \(F_s\)、\(F_g\)、\(W\)、SFC，横轴为 Ma。
+
+```matlab
+results = run_speed_char;
+```
+
+默认 H = 0 km，Ma 从 0 扫到 1.2。高空速度特性先在 Ma = 0 爬升到指定高度（不记入曲线），再扫 Ma：
+
+```matlab
+results = run_speed_char('HKm', 11);
+```
+
+结果覆盖写入 `speed_char_results.mat`、`speed_char.png` / `.fig`。只重画：
+
+```matlab
+results = run_speed_char('PlotOnly', true);
+```
+
 ## 目录
 
 | 文件 / 目录 | 作用 |
@@ -75,8 +128,10 @@ results = run_throttle_char('PlotOnly', true);
 | `GasTurbine_SS_setup_everything.m` | 装载 `MWS`、打开模型 |
 | `SimSetup/` | 部件特性图、求解器初值、喷管面积等 |
 | `run_throttle_char.m` | 地面节流扫描与作图 |
+| `run_altitude_char.m` | 高度特性扫描与作图（默认 \(T_4\) 不变） |
+| `run_speed_char.m` | 速度特性扫描与作图（默认 \(T_4\) 不变） |
 | `PlotSSData.m` | 官方站参数作图入口 |
 
 ## 来源
 
-原始示例与模块来自 NASA Glenn Research Center 的 T-MATS（Apache 2.0）。节流扫描脚本是在该示例上为学习地面节流特性增加的。
+原始示例与模块来自 NASA Glenn Research Center 的 T-MATS（Apache 2.0）。节流、高度、速度扫描脚本是在该示例上为学习特性曲线增加的。
