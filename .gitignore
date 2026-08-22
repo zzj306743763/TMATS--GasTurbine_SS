@@ -1,6 +1,7 @@
 # Only publish the single-spool turbojet SS example as a folder.
 /*
 !/.gitignore
+!/README.md
 !/Example_GasTurbine_SS/
 !/Example_GasTurbine_SS/**
 

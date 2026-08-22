@@ -14,7 +14,8 @@ function results = run_throttle_char(varargin)
 %    任一步不收敛：在上一点与失败点之间对分；步长小于 dWfMin 则停止
 %  注意：单轴涡喷在大状态附近 Wf 降得快、N 降得慢。默认燃油下限 0.15 pps，
 %  不要把它理解成“算到 NcMap=0.5”。图横轴 0.5～1.05 是特性图范围，不是已算到的范围。
-%  图：NcMap–Fn / NcMap–SFC，SFC–总推力，以及 Wf / SM / T4 / R-line 诊断图。结果每次覆盖。
+%  图：同时保存 png 和 fig。fig 可在 MATLAB 中双击或 openfig 打开。
+%  只重画、不重新仿真：  results = run_throttle_char('PlotOnly', true);
 %
 %  每一档用上一档收敛的 [W; Rline; 涡轮PR; N] 作为 NR 初值。
 %  退出时恢复燃油和 NR_IC，并删除本次临时加上的记录模块；不要保存官方 mdl。
@@ -28,7 +29,34 @@ function results = run_throttle_char(varargin)
     addParameter(p, 'dWfMin', 0.01, @isnumeric);
     addParameter(p, 'WfMinAbs', 0.15, @isnumeric);
     addParameter(p, 'SaveFig', true, @islogical);
+    addParameter(p, 'PlotOnly', false, @islogical);
     parse(p, varargin{:});
+
+    outdir = fileparts(mfilename('fullpath'));
+    matfile = fullfile(outdir, 'throttle_char_results.mat');
+    figNc   = fullfile(outdir, 'throttle_char.png');
+    figSFC  = fullfile(outdir, 'throttle_char_sfc_vs_fn.png');
+    figOps  = fullfile(outdir, 'throttle_char_ops.png');
+
+    if p.Results.PlotOnly
+        if exist(matfile, 'file') ~= 2
+            error('找不到 %s。请先完整跑一次 run_throttle_char。', matfile);
+        end
+        S = load(matfile, 'results');
+        results = S.results;
+        print_scan_summary(results, p.Results.WfMinAbs);
+        hFigs = plot_throttle(results);
+        if p.Results.SaveFig && ~isempty(hFigs)
+            save_throttle_figure(hFigs(1), figNc);
+            save_throttle_figure(hFigs(2), figSFC);
+            if numel(hFigs) >= 3
+                save_throttle_figure(hFigs(3), figOps);
+            end
+            fprintf('已用现有结果重画并覆盖 png/fig。查看：  openfig(''%s'');\n', ...
+                strrep(figNc, '.png', '.fig'));
+        end
+        return
+    end
 
     mdl = p.Results.Model;
     WfDes = p.Results.WfDes;
@@ -94,27 +122,22 @@ function results = run_throttle_char(varargin)
 
     print_scan_summary(results, WfMinAbs);
 
-    outdir = fileparts(mfilename('fullpath'));
-    matfile = fullfile(outdir, 'throttle_char_results.mat');
-    figNc   = fullfile(outdir, 'throttle_char.png');
-    figSFC  = fullfile(outdir, 'throttle_char_sfc_vs_fn.png');
-    figOps  = fullfile(outdir, 'throttle_char_ops.png');
     overwrite_file(matfile);
     save(matfile, 'results');
     fprintf('数据已覆盖保存: %s\n', matfile);
 
     hFigs = plot_throttle(results);
     if p.Results.SaveFig && ~isempty(hFigs)
-        overwrite_file(figNc);
-        overwrite_file(figSFC);
-        saveas(hFigs(1), figNc);
-        saveas(hFigs(2), figSFC);
-        fprintf('图已覆盖保存:\n  %s\n  %s\n', figNc, figSFC);
+        save_throttle_figure(hFigs(1), figNc);
+        save_throttle_figure(hFigs(2), figSFC);
+        fprintf('图已覆盖保存（png 方便插入文档，fig 可在 MATLAB 里双击或 openfig 打开）:\n');
+        fprintf('  %s\n  %s\n', figNc, figSFC);
         if numel(hFigs) >= 3
-            overwrite_file(figOps);
-            saveas(hFigs(3), figOps);
+            save_throttle_figure(hFigs(3), figOps);
             fprintf('  %s\n', figOps);
         end
+        fprintf('在 MATLAB 中查看：  openfig(''%s'');\n', ...
+            strrep(figNc, '.png', '.fig'));
     end
 
     function [res, x_out, Wf_out, reached] = sweep_down(res, Wf_ok1, x_ok, dNom, Wf_bound, until_fail, dMin)
@@ -576,6 +599,15 @@ function overwrite_file(fpath)
     end
 end
 
+function save_throttle_figure(h, pngPath)
+    [folder, name] = fileparts(pngPath);
+    figPath = fullfile(folder, [name '.fig']);
+    overwrite_file(pngPath);
+    overwrite_file(figPath);
+    saveas(h, pngPath);
+    savefig(h, figPath);
+end
+
 function print_scan_summary(results, WfMinAbs)
     ok = results.converged;
     nAll = numel(results.Wf_pps);
@@ -640,9 +672,6 @@ function hFigs = plot_throttle(results)
     Rl = Rl(idx);
     T4K = T4K(idx);
     [sfcMin, iS] = min(sfc);
-    xmax = max(1.05, max(NcMap));
-    note = sprintf('已算 NcMap = %.3f～%.3f（横轴 0.50～1.05 是特性图范围）', ...
-        min(NcMap), max(NcMap));
 
     h1 = figure('Name', 'Throttle vs NcMap', 'Color', 'w');
 
@@ -651,7 +680,7 @@ function hFigs = plot_throttle(results)
     grid on
     xlabel(xlab);
     ylabel('F_n  [lbf]');
-    xlim([0.5 xmax]);
+    apply_ncmap_xaxis();
     title(['地面节流特性（推力–' tNc '）']);
 
     subplot(1, 2, 2);
@@ -661,11 +690,10 @@ function hFigs = plot_throttle(results)
     grid on
     xlabel(xlab);
     ylabel('SFC  [lbm/h/lbf]');
-    xlim([0.5 xmax]);
+    apply_ncmap_xaxis();
     title(['地面节流特性（耗油率–' tNc '）']);
     legend({'SFC', sprintf('最低 SFC = %.3f', sfcMin)}, 'Location', 'northwest');
-    annotation('textbox', [0.12 0.01 0.76 0.05], 'String', note, ...
-        'EdgeColor', 'none', 'HorizontalAlignment', 'center', 'FontSize', 8);
+    sgtitle(sprintf('已算 N_{c,map} = %.3f ~ %.3f', min(NcMap), max(NcMap)));
 
     [Fn2, idx2] = sort(Fn);
     sfc2 = sfc(idx2);
@@ -685,7 +713,7 @@ function hFigs = plot_throttle(results)
     grid on
     xlabel(xlab);
     ylabel('W_f  [pps]');
-    xlim([0.5 xmax]);
+    apply_ncmap_xaxis();
     title('燃油–换算转速（大状态附近很陡）');
 
     subplot(2, 2, 2);
@@ -693,7 +721,7 @@ function hFigs = plot_throttle(results)
     grid on
     xlabel(xlab);
     ylabel('SM  [%]');
-    xlim([0.5 xmax]);
+    apply_ncmap_xaxis();
     title('压气机喘振裕度');
 
     subplot(2, 2, 3);
@@ -701,7 +729,7 @@ function hFigs = plot_throttle(results)
     grid on
     xlabel(xlab);
     ylabel('T_4  [K]');
-    xlim([0.5 xmax]);
+    apply_ncmap_xaxis();
     title('涡轮前温度');
 
     subplot(2, 2, 4);
@@ -709,8 +737,13 @@ function hFigs = plot_throttle(results)
     grid on
     xlabel(xlab);
     ylabel('R-line  [-]');
-    xlim([0.5 xmax]);
+    apply_ncmap_xaxis();
     title('压气机 R-line（增大表示离开喘振线）');
 
     hFigs = [h1, h2, h3];
+end
+
+function apply_ncmap_xaxis()
+    xlim([0.50 1.05]);
+    xticks([0.50:0.10:1.00, 1.05]);
 end
