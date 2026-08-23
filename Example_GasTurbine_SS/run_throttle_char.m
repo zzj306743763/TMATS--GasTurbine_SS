@@ -14,7 +14,8 @@ function results = run_throttle_char(varargin)
 %    任一步不收敛：在上一点与失败点之间对分；步长小于 dWfMin 则停止
 %  注意：单轴涡喷在大状态附近 Wf 降得快、N 降得慢。默认燃油下限 0.15 pps，
 %  不要把它理解成“算到 NcMap=0.5”。图横轴 0.5～1.05 是特性图范围，不是已算到的范围。
-%  图：总推力用喷管毛推力 Fg（地面 Ma=0 时与净推力相同）。同时保存 png 和 fig。
+%  图：推力用净推力 Fn = Fg − Fram。地面 Ma=0 时冲压阻力为零，Fn=Fg。
+%  耗油率 SFC = 3600 Wf / Fn。同时保存 png 和 fig。
 %  只重画、不重新仿真：  results = run_throttle_char('PlotOnly', true);
 %
 %  每一档用上一档收敛的 [W; Rline; 涡轮PR; N] 作为 NR 初值。
@@ -35,7 +36,7 @@ function results = run_throttle_char(varargin)
     outdir = fileparts(mfilename('fullpath'));
     matfile = fullfile(outdir, 'throttle_char_results.mat');
     figNc   = fullfile(outdir, 'throttle_char.png');
-    figSFC  = fullfile(outdir, 'throttle_char_sfc_vs_fg.png');
+    figSFC  = fullfile(outdir, 'throttle_char_sfc_vs_fn.png');
     figOps  = fullfile(outdir, 'throttle_char_ops.png');
 
     if p.Results.PlotOnly
@@ -93,7 +94,7 @@ function results = run_throttle_char(varargin)
 
     fprintf('\n=== 地面节流扫描 (H=0, MN=0, iDesign=2) ===\n');
     fprintf('%6s  %8s  %10s  %8s  %10s  %8s  %s\n', ...
-        'Wf', 'N', 'NcMap', 'Fg', 'SFC', 'SM', 'status');
+        'Wf', 'N', 'NcMap', 'Fn', 'SFC', 'SM', 'status');
 
     % --- 1) 设计点 ---
     fprintf('-- 1) 设计点 %.2f pps --\n', WfDes);
@@ -198,7 +199,7 @@ function results = run_throttle_char(varargin)
             flag = 'NOT CONVERGED';
         end
         fprintf('%6.2f  %8.1f  %10.4f  %8.1f  %10.4f  %8.2f  %s\n', ...
-            row.Wf_pps, row.N_rpm, row.NcMap, row.Fg_lbf, row.SFC_pph_lbf, ...
+            row.Wf_pps, row.N_rpm, row.NcMap, row.Fn_lbf, row.SFC_pph_lbf, ...
             row.SM_pct, flag);
     end
 
@@ -240,9 +241,9 @@ function results = run_throttle_char(varargin)
             row.Fg_N     = Fg_end * 4.4482216153;
             row.Fn_lbf   = Fg_end;
             row.Fn_N     = row.Fg_N;
-            if Fg_end ~= 0 && isfinite(Fg_end)
-                row.SFC_pph_lbf = 3600 * Wf / Fg_end;
-                row.SFC_kgN_s   = (Wf * 0.45359237) / row.Fg_N;
+            if isfinite(row.Fn_lbf) && row.Fn_lbf ~= 0
+                row.SFC_pph_lbf = 3600 * Wf / row.Fn_lbf;
+                row.SFC_kgN_s   = (Wf * 0.45359237) / row.Fn_N;
             end
             row.converged = ok;
             row.PR_comp  = last_num(Cdat, 'PR');
@@ -632,9 +633,9 @@ function print_scan_summary(results, WfMinAbs)
         'SM = %.1f %%，Rline = %.3f）\n'], ...
         ncMin, results.N_rpm(i), results.Wf_pps(i), ...
         results.SM_pct(i), results.Rline(i));
-    FgAll = throttle_Fg(results);
-    fprintf('最低 SFC = %.4f，出现在 NcMap = %.4f，Fg = %.1f lbf\n', ...
-        sfcMin, results.NcMap(j), FgAll(j));
+    FnAll = throttle_Fn(results);
+    fprintf('最低 SFC = %.4f，出现在 NcMap = %.4f，Fn = %.1f lbf\n', ...
+        sfcMin, results.NcMap(j), FnAll(j));
     hitFloor = results.converged(i) && (results.Wf_pps(i) <= WfMinAbs + 1e-6);
     if nOk == nAll && hitFloor
         fprintf(['停止原因：碰到脚本燃油下限 %.2f pps，这一档仍然收敛。', ...
@@ -655,8 +656,8 @@ function hFigs = plot_throttle(results)
         return
     end
     NcMap = results.NcMap(ok);
-    Fg = throttle_Fg(results);
-    Fg = Fg(ok);
+    Fn = throttle_Fn(results);
+    Fn = Fn(ok);
     sfc = results.SFC_pph_lbf(ok);
     Wf = results.Wf_pps(ok);
     SM = results.SM_pct(ok);
@@ -673,7 +674,7 @@ function hFigs = plot_throttle(results)
     xlab = 'N_{c,map}  [-]';
     tNc = '压气机换算转速';
     [NcMap, idx] = sort(NcMap);
-    Fg = Fg(idx);
+    Fn = Fn(idx);
     sfc = sfc(idx);
     Wf = Wf(idx);
     SM = SM(idx);
@@ -684,12 +685,12 @@ function hFigs = plot_throttle(results)
     h1 = figure('Name', 'Throttle vs NcMap', 'Color', 'w');
 
     subplot(1, 2, 1);
-    plot(NcMap, Fg, 'o-', 'LineWidth', 1.5);
+    plot(NcMap, Fn, 'o-', 'LineWidth', 1.5);
     grid on
     xlabel(xlab);
-    ylabel('F_g  [lbf]');
+    ylabel('F_n  [lbf]');
     apply_ncmap_xaxis();
-    title(['地面节流特性（总推力–' tNc '）']);
+    title(['地面节流特性（净推力–' tNc '）']);
 
     subplot(1, 2, 2);
     plot(NcMap, sfc, 'o-', 'LineWidth', 1.5);
@@ -703,16 +704,16 @@ function hFigs = plot_throttle(results)
     legend({'SFC', sprintf('最低 SFC = %.3f', sfcMin)}, 'Location', 'northwest');
     sgtitle(sprintf('已算 N_{c,map} = %.3f ~ %.3f', min(NcMap), max(NcMap)));
 
-    [Fg2, idx2] = sort(Fg);
+    [Fn2, idx2] = sort(Fn);
     sfc2 = sfc(idx2);
-    h2 = figure('Name', 'SFC vs thrust', 'Color', 'w');
-    plot(Fg2, sfc2, 'o-', 'LineWidth', 1.5);
+    h2 = figure('Name', 'SFC vs Fn', 'Color', 'w');
+    plot(Fn2, sfc2, 'o-', 'LineWidth', 1.5);
     hold on
-    plot(Fg(iS), sfcMin, 'rd', 'MarkerSize', 8, 'LineWidth', 1.2);
+    plot(Fn(iS), sfcMin, 'rd', 'MarkerSize', 8, 'LineWidth', 1.2);
     grid on
-    xlabel('F_g  [lbf]  （总推力）');
+    xlabel('F_n  [lbf]  （净推力）');
     ylabel('SFC  [lbm/h/lbf]');
-    title('地面节流特性（耗油率–总推力）');
+    title('地面节流特性（耗油率–净推力）');
     legend({'SFC', sprintf('最低 SFC = %.3f', sfcMin)}, 'Location', 'northwest');
 
     h3 = figure('Name', 'Throttle operating line', 'Color', 'w');
@@ -756,10 +757,10 @@ function apply_ncmap_xaxis()
     xticks([0.50:0.10:1.00, 1.05]);
 end
 
-function Fg = throttle_Fg(results)
-    if isfield(results, 'Fg_lbf') && ~isempty(results.Fg_lbf)
-        Fg = results.Fg_lbf;
+function Fn = throttle_Fn(results)
+    if isfield(results, 'Fn_lbf') && ~isempty(results.Fn_lbf)
+        Fn = results.Fn_lbf;
     else
-        Fg = results.Fn_lbf;
+        Fn = results.Fg_lbf;
     end
 end

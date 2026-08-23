@@ -17,17 +17,19 @@ function results = run_altitude_char(varargin)
 %  默认 Ma = 0.9（飞行高度特性）。海平面静止高度特性用：
 %    results = run_altitude_char('MN', 0);
 %
-%  先在 H=0 把马赫数升到目标值并配平油门，再按 1 km 往上扫；
-%  失败则对分，步长小于 dHMin 则停止。
-%  图：单位推力 Fs=Fg/W、总推力 Fg、空气流量 W、耗油率 SFC=3600*Wf/Fg，均对高度。
-%  用喷管毛推力 Fg，不用净推力 Fn。图同时存 png 和 fig。
+%  先在 H=0 按 0.1 把马赫数升到目标值并配平油门（加速段不记入曲线），再按 1 km 往上扫；
+%  失败则对分；小步成功后先补上尚未越过的失败高度，不把步长立刻恢复成 1 km。
+%  步长小于 dHMin 则停止。换算转速超出压气机图转速线范围即结束，不外延。
+%  图：Fs、Fn、W、SFC 对高度；另存 NcMap 随高度。
+%  飞行特性用净推力 Fn = Fg − Fram（教材定义）。毛推力 Fg 仍写入结果。
+%  Ma>0 时若用 Fg 算 SFC，对流层内会随高度上升，与教材相反。
 %  只重画：  results = run_altitude_char('PlotOnly', true);
 %  退出时恢复高度、马赫数、燃油和 NR_IC；不要保存官方 mdl。
 
     p = inputParser;
     addParameter(p, 'Model', 'GasTurbine_SS_Template', @ischar);
     addParameter(p, 'MN', 0.90, @isnumeric);
-    addParameter(p, 'dMN', 0.20, @isnumeric);
+    addParameter(p, 'dMN', 0.10, @isnumeric);
     addParameter(p, 'WfDes', 3.00, @isnumeric);
     addParameter(p, 'ThrottleMode', 'T4', @ischar);
     addParameter(p, 'ThrottleTarget', nan, @isnumeric);
@@ -43,6 +45,7 @@ function results = run_altitude_char(varargin)
     outdir = fileparts(mfilename('fullpath'));
     matfile = fullfile(outdir, 'altitude_char_results.mat');
     figMain = fullfile(outdir, 'altitude_char.png');
+    figNcMap = fullfile(outdir, 'altitude_char_ncmap.png');
 
     if p.Results.PlotOnly
         if exist(matfile, 'file') ~= 2
@@ -54,6 +57,9 @@ function results = run_altitude_char(varargin)
         hFigs = plot_altitude(results);
         if p.Results.SaveFig && ~isempty(hFigs)
             save_char_figure(hFigs(1), figMain);
+            if numel(hFigs) >= 2
+                save_char_figure(hFigs(2), figNcMap);
+            end
             fprintf('已用现有结果重画。查看：  openfig(''%s'');\n', ...
                 strrep(figMain, '.png', '.fig'));
         end
@@ -71,13 +77,21 @@ function results = run_altitude_char(varargin)
     dHMinKm = p.Results.dHMinKm;
     WfMin = p.Results.WfMin;
     WfMax = p.Results.WfMax;
+    if ~(isfinite(dMN) && dMN > 0)
+        error('dMN 必须为正。当前为 %g。', dMN);
+    end
 
     if evalin('base', 'exist(''MWS'',''var'')') ~= 1
         error(['工作区没有 MWS。请先在本目录运行 GasTurbine_SS_setup_everything，', ...
                '再调用 run_altitude_char。']);
     end
     MWS = evalin('base', 'MWS');
+    [ncMapMin, ncMapMax] = hpc_ncmap_range(MWS);
     NR_IC0 = MWS.Solve.NR_IC(:);
+    NR_dx0 = MWS.Solve.NR_dx;
+    SimTime0 = MWS.in.SimTime;
+    MWS.in.SimTime = max(SimTime0, 1000 * MWS.Solve.T);
+    assignin('base', 'MWS', MWS);
 
     if ~bdIsLoaded(mdl)
         load_system(mdl);
@@ -99,6 +113,7 @@ function results = run_altitude_char(varargin)
     added_blocks = ensure_altitude_logs(mdl); %#ok<NASGU>
     cu = struct('mdl', mdl, 'wfBlk', wfBlk, 'solverBlk', solverBlk, ...
         'altBlk', altBlk, 'mnBlk', mnBlk, 'NR_IC0', NR_IC0, ...
+        'NR_dx0', NR_dx0, 'SimTime0', SimTime0, ...
         'Wf0_str', Wf0_str, 'Alt0_str', Alt0_str, 'MN0_str', MN0_str);
     cleanupObj = onCleanup(@() restore_altitude_cleanup(cu)); %#ok<NASGU>
 
@@ -106,10 +121,13 @@ function results = run_altitude_char(varargin)
     results.meta.MN = MN;
     results.meta.ThrottleMode = mode;
     results.meta.HMaxKm = HMaxKm;
+    results.meta.dMN = dMN;
+    results.meta.NcMapMin = ncMapMin;
+    results.meta.NcMapMax = ncMapMax;
 
     fprintf('\n=== 高度特性扫描 (MN=%.2f, 控制规律=%s, iDesign=2) ===\n', MN, mode);
     fprintf('%7s  %7s  %8s  %8s  %8s  %8s  %8s  %6s  %s\n', ...
-        'H_km', 'Wf', 'W', 'NcMap', 'Fg', 'Fs', 'SFC', 'SM', 'status');
+        'H_km', 'Wf', 'W', 'NcMap', 'Fn', 'Fs', 'SFC', 'SM', 'status');
 
     fprintf('-- 0) 海平面静止锚点 Wf=%.2f，作为牛顿初值 --\n', WfDes);
     [rowSLS, x_next, okSLS] = run_one_point(0, 0, WfDes, NR_IC0);
@@ -135,31 +153,44 @@ function results = run_altitude_char(varargin)
     Wf_next = WfDes;
 
     if MN > 1e-6
-        mnList = unique([dMN:dMN:MN, MN]);
-        fprintf('-- 1) 在 H=0 把马赫数升到 %.2f --\n', MN);
+        mnList = unique(round([dMN:dMN:MN, MN], 8));
+        mnList = mnList(mnList > 1e-9 & mnList <= MN + 1e-8);
+        if isempty(mnList)
+            mnList = MN;
+        end
+        fprintf('-- 1) 在 H=0 按 %.2f 把马赫数升到 %.2f（不记入高度曲线） --\n', ...
+            dMN, MN);
         for i = 1:numel(mnList)
             mnTry = mnList(i);
-            Wf_g = Wf_next;
+            if i == 1
+                pRat = ram_pt_ratio(mnTry) / ram_pt_ratio(0);
+            else
+                pRat = ram_pt_ratio(mnTry) / ram_pt_ratio(mnList(i-1));
+            end
+            Wf_g = min(max(Wf_next * pRat, WfMin), WfMax);
+            x_g = x_next(:);
+            x_g(1) = x_next(1) * pRat;
             [rowMN, x_try, Wf_try, okMN] = trim_point( ...
-                0, mnTry, Wf_g, x_next, false);
+                0, mnTry, Wf_g, x_g, false);
             if ~okMN
                 error('H=0、MN=%.2f 未能配平油门，停止。可减小 dMN 再试。', mnTry);
             end
             x_next = x_try;
             Wf_next = Wf_try;
-            fprintf('    MN=%.2f  配平  Wf=%.3f  N=%.1f  NcMap=%.4f  T4=%.1f R\n', ...
-                mnTry, rowMN.Wf_pps, rowMN.N_rpm, rowMN.NcMap, rowMN.Tt4_R);
+            fprintf('    MN=%.2f  配平  Wf=%.3f  N=%.1f  NcMap=%.4f  T4=%.1f K\n', ...
+                mnTry, rowMN.Wf_pps, rowMN.N_rpm, rowMN.NcMap, rowMN.Tt4_R * 5/9);
         end
+        results = append_alt_result(results, rowMN);
+        print_alt_row(rowMN, 'OK');
     else
         fprintf('-- 1) MN=0，跳过加速，直接从海平面静止开始 --\n');
+        [~, x_next, Wf_next, ok0] = trim_point(0, MN, Wf_next, x_next, true);
+        if ~ok0
+            error('H=0、MN=%.2f 配平失败。', MN);
+        end
     end
 
     fprintf('-- 2) 在 MN=%.2f 上扫高度，步长 %.2f km --\n', MN, dHKm);
-    [~, x_next, Wf_next, ok0] = trim_point(0, MN, Wf_next, x_next, true);
-    if ~ok0
-        error('H=0、MN=%.2f 配平失败。', MN);
-    end
-
     sweep_up_alt(0, x_next, Wf_next, dHKm, HMaxKm, dHMinKm);
 
     print_alt_summary(results);
@@ -172,6 +203,10 @@ function results = run_altitude_char(varargin)
     if p.Results.SaveFig && ~isempty(hFigs)
         save_char_figure(hFigs(1), figMain);
         fprintf('图已覆盖保存（png + fig）:\n  %s\n', figMain);
+        if numel(hFigs) >= 2
+            save_char_figure(hFigs(2), figNcMap);
+            fprintf('  %s\n', figNcMap);
+        end
         fprintf('在 MATLAB 中查看：  openfig(''%s'');\n', ...
             strrep(figMain, '.png', '.fig'));
     end
@@ -180,27 +215,49 @@ function results = run_altitude_char(varargin)
         x_out = x_ok;
         Wf_out = Wf_ok;
         d = dNom;
+        H_block = inf;
         nGuard = 0;
         while nGuard < 80 && H_ok < HMax - 1e-9
             nGuard = nGuard + 1;
             H_try = round(H_ok + d, 4);
+            if isfinite(H_block)
+                H_try = min(H_try, H_block);
+            end
             if H_try > HMax + 1e-9
                 H_try = HMax;
             end
+            if H_try <= H_ok + 1e-9
+                fprintf(['    与上一成功点 %.2f km 的间隔已小于可分步长，停止上行。\n'], ...
+                    H_ok);
+                break
+            end
             ps0 = tmats_ps_psi(km2ft(H_ok));
             ps1 = tmats_ps_psi(km2ft(H_try));
-            Wf_g = Wf_out * max(ps1, 0.05) / max(ps0, 0.05);
+            pRat = max(ps1, 0.05) / max(ps0, 0.05);
+            Wf_g = Wf_out * pRat;
             Wf_g = min(max(Wf_g, WfMin), WfMax);
+            x_g = x_out(:);
+            x_g(1) = x_out(1) * pRat;
 
-            [~, x_try, Wf_try, ok] = trim_point(H_try, MN, Wf_g, x_out, true);
+            [~, x_try, Wf_try, ok, why] = trim_point(H_try, MN, Wf_g, x_g, true);
             if ok
                 H_ok = H_try;
                 x_out = x_try;
                 Wf_out = Wf_try;
-                d = dNom;
+                if H_ok + 1e-9 >= H_block
+                    H_block = inf;
+                    d = dNom;
+                else
+                    d = min(dNom, H_block - H_ok);
+                end
                 continue
             end
+            if strcmp(why, 'offmap')
+                fprintf('    超出压气机特性图范围，高度扫描结束（不外延）。\n');
+                break
+            end
 
+            H_block = min(H_block, H_try);
             H_mid = round(0.5 * (H_ok + H_try), 4);
             step = H_mid - H_ok;
             if step < dMin - 1e-12
@@ -217,11 +274,12 @@ function results = run_altitude_char(varargin)
         end
     end
 
-    function [row, x_out, Wf_out, ok] = trim_point(H_km, mn, Wf_g, x_ic, store)
+    function [row, x_out, Wf_out, ok, why] = trim_point(H_km, mn, Wf_g, x_ic, store)
         row = blank_alt_row(H_km, mn, Wf_g);
         x_out = x_ic(:);
         Wf_out = Wf_g;
         ok = false;
+        why = 'fail';
         Wf = min(max(Wf_g, WfMin), WfMax);
         x = x_ic(:);
         Wf_prev = nan;
@@ -230,28 +288,38 @@ function results = run_altitude_char(varargin)
             [row, x, conv] = run_one_point(H_km, mn, Wf, x);
             if ~conv
                 fprintf('%7.2f  %7.3f  -- 仿真未收敛 (trim %d)\n', H_km, Wf, it);
+                if it < 8
+                    x = x_ic(:);
+                    if isfinite(Wf_prev)
+                        Wf = 0.5 * (Wf + Wf_prev);
+                    else
+                        Wf = min(max(Wf * 0.92, WfMin), WfMax);
+                    end
+                    continue
+                end
                 if store
-                    results = append_alt_result(results, row); %#ok<NASGU>
                     print_alt_row(row, 'NOT CONVERGED');
                 end
-                return
-            end
-            if row.NcMap > 1.055 || row.NcMap < 0.495
-                fprintf(['%7.2f  %7.3f  -- NcMap=%.4f 超出特性图 0.50～1.05', ...
-                    ' (trim %d)\n'], H_km, Wf, row.NcMap, it);
-                row.converged = false;
-                if store
-                    results = append_alt_result(results, row);
-                    print_alt_row(row, 'OFF MAP');
-                end
+                why = 'nr';
                 return
             end
             [y, ~] = throttle_mismatch(row, mode, target);
             tol = throttle_tol(mode);
             if abs(y) <= tol
+                if ncmap_off_map(row.NcMap, ncMapMin, ncMapMax)
+                    fprintf(['%7.2f  %7.3f  -- NcMap=%.4f 超出特性图 %.2f～%.2f，停止。\n'], ...
+                        H_km, Wf, row.NcMap, ncMapMin, ncMapMax);
+                    row.converged = false;
+                    if store
+                        print_alt_row(row, 'OFF MAP');
+                    end
+                    why = 'offmap';
+                    return
+                end
                 Wf_out = Wf;
                 x_out = x;
                 ok = true;
+                why = '';
                 row.converged = true;
                 if store
                     results = append_alt_result(results, row);
@@ -281,8 +349,15 @@ function results = run_altitude_char(varargin)
         fprintf('%7.2f  -- 油门未配平到 %s=%.4g（最后 %s=%.4g）\n', ...
             H_km, mode, target, mode, throttle_meas(row, mode));
         row.converged = false;
+        if ncmap_off_map(row.NcMap, ncMapMin, ncMapMax)
+            if store
+                print_alt_row(row, 'OFF MAP');
+            end
+            why = 'offmap';
+            return
+        end
+        why = 'trim';
         if store
-            results = append_alt_result(results, row);
             print_alt_row(row, 'TRIM FAIL');
         end
     end
@@ -300,8 +375,9 @@ function results = run_altitude_char(varargin)
         set_param(solverBlk, 'SNR_IC_M', 'MWS.Solve.NR_IC');
 
         try
-            simOut = sim(mdl, 'ReturnWorkspaceOutputs', 'on', ...
-                'SrcWorkspace', 'base');
+            simOut = [];
+            evalc(['simOut = sim(mdl, ''ReturnWorkspaceOutputs'', ''on'', ', ...
+                '''SrcWorkspace'', ''base'');']);
         catch ME
             fprintf('%7.2f  -- 仿真出错: %s\n', H_km, ME.message);
             return
@@ -317,7 +393,14 @@ function results = run_altitude_char(varargin)
 
             x = ts_last_vec(NR_X, 4);
             Fg_end = ts_last_scalar(Fg);
-            ok = last_flag(Sdat, 'Converged');
+            idxC = last_true_index(Sdat, 'Converged');
+            ok = idxC > 0;
+            tHit = [];
+            if ok
+                tHit = ts_time_at(bus_field(Sdat, 'Converged'), idxC);
+                x = ts_vec_at_time(NR_X, 4, tHit);
+                Fg_end = ts_scalar_at_time(Fg, tHit);
+            end
 
             row.NR_X     = x.';
             row.W_pps    = x(1);
@@ -327,28 +410,37 @@ function results = run_altitude_char(varargin)
             row.Fg_lbf   = Fg_end;
             row.Fg_N     = Fg_end * 4.4482216153;
             row.Fram_lbf = extract_fram(Adat, row.W_pps);
+            if ~(isfinite(row.Fram_lbf) && row.Fram_lbf > 0) && mn > 1e-6
+                row.Fram_lbf = ram_drag_lbf(row.W_pps, mn, H_km);
+            end
+            if ~isfinite(row.Fram_lbf)
+                row.Fram_lbf = ram_drag_lbf(row.W_pps, mn, H_km);
+            end
             row.Fn_lbf   = Fg_end - row.Fram_lbf;
             row.Fn_N     = row.Fn_lbf * 4.4482216153;
-            if isfinite(Fg_end) && Fg_end ~= 0
-                row.SFC_pph_lbf = 3600 * Wf / Fg_end;
-                row.SFC_kgN_s   = (Wf * 0.45359237) / row.Fg_N;
+            if isfinite(row.Fn_lbf) && row.Fn_lbf > 1e-6
+                row.SFC_pph_lbf = 3600 * Wf / row.Fn_lbf;
+                row.SFC_kgN_s   = (Wf * 0.45359237) / row.Fn_N;
             end
-            if isfinite(Fg_end) && isfinite(row.W_pps) && row.W_pps ~= 0
-                row.Fs_lbf_pps = Fg_end / row.W_pps;
-                row.Fs_N_kgs   = row.Fg_N / (row.W_pps * 0.45359237);
+            if isfinite(row.Fn_lbf) && isfinite(row.W_pps) && row.W_pps ~= 0
+                row.Fs_lbf_pps = row.Fn_lbf / row.W_pps;
+                row.Fs_N_kgs   = row.Fn_N / (row.W_pps * 0.45359237);
             end
             row.converged = ok;
-            row.PR_comp  = last_num(Cdat, 'PR');
-            row.SM_pct   = last_num(Cdat, 'SMavail');
-            row.Nc       = last_num(Cdat, 'Nc');
-            row.NcMap    = last_num(Cdat, 'NcMap');
+            row.PR_comp  = num_at_time(Cdat, 'PR', tHit);
+            row.SM_pct   = num_at_time(Cdat, 'SMavail', tHit);
+            row.Nc       = num_at_time(Cdat, 'Nc', tHit);
+            row.NcMap    = num_at_time(Cdat, 'NcMap', tHit);
             if ~isfinite(row.NcMap)
-                sNc = last_num_soft(Cdat, 's_C_Nc');
+                sNc = num_at_time(Cdat, 's_C_Nc', tHit);
+                if ~isfinite(sNc)
+                    sNc = last_num_soft(Cdat, 's_C_Nc');
+                end
                 if isfinite(sNc) && sNc ~= 0 && isfinite(row.Nc)
                     row.NcMap = row.Nc / sNc;
                 end
             end
-            row.Tt4_R = last_num(s4, 'Tt');
+            row.Tt4_R = num_at_time(s4, 'Tt', tHit);
             if ok
                 x_out = x(:);
             end
@@ -365,6 +457,12 @@ function restore_altitude_cleanup(cu)
         if evalin('base', 'exist(''MWS'',''var'')') == 1
             MWSb = evalin('base', 'MWS');
             MWSb.Solve.NR_IC = cu.NR_IC0;
+            if isfield(cu, 'NR_dx0') && isfinite(cu.NR_dx0)
+                MWSb.Solve.NR_dx = cu.NR_dx0;
+            end
+            if isfield(cu, 'SimTime0') && isfinite(cu.SimTime0)
+                MWSb.in.SimTime = cu.SimTime0;
+            end
             assignin('base', 'MWS', MWSb);
         end
         if bdIsLoaded(cu.mdl)
@@ -449,7 +547,7 @@ end
 
 function print_alt_row(row, flag)
     fprintf('%7.2f  %7.3f  %8.2f  %8.4f  %8.1f  %8.2f  %8.4f  %6.2f  %s\n', ...
-        row.H_km, row.Wf_pps, row.W_pps, row.NcMap, row.Fg_lbf, ...
+        row.H_km, row.Wf_pps, row.W_pps, row.NcMap, row.Fn_lbf, ...
         row.Fs_lbf_pps, row.SFC_pph_lbf, row.SM_pct, flag);
 end
 
@@ -572,6 +670,26 @@ end
 
 function ft = km2ft(km)
     ft = km * 3280.839895;
+end
+
+function T_R = isa_T_R(h_km)
+    T_K = 216.65 * ones(size(h_km));
+    inTrop = h_km < 11;
+    T_K(inTrop) = 288.15 - 6.5 * h_km(inTrop);
+    T_R = T_K * 9/5;
+end
+
+function Fram = ram_drag_lbf(W, mn, h_km)
+    if ~(isfinite(mn) && mn > 0)
+        Fram = zeros(size(W));
+        return
+    end
+    a = 1116.4505 * sqrt(isa_T_R(h_km) / 518.67);
+    Fram = W .* (mn .* a) / 32.174;
+end
+
+function r = ram_pt_ratio(mn)
+    r = (1 + 0.2 * mn.^2).^3.5;
 end
 
 function ps = tmats_ps_psi(h_ft)
@@ -757,6 +875,102 @@ function s = ts_last_scalar(ts)
     s = double(d(end));
 end
 
+function idx = last_true_index(obj, fieldName)
+    idx = 0;
+    try
+        y = bus_field(obj, fieldName);
+        d = squeeze(ts_data(y));
+        d = d(:);
+        hit = find(d > 0.5, 1, 'last');
+        if ~isempty(hit)
+            idx = hit;
+        end
+    catch
+    end
+end
+
+function t = ts_time_at(ts, idx)
+    t = [];
+    ts = unwrap_signal(ts);
+    try
+        if isa(ts, 'timeseries') && idx >= 1 && idx <= numel(ts.Time)
+            t = ts.Time(idx);
+        end
+    catch
+    end
+end
+
+function s = ts_scalar_at_time(ts, tHit)
+    if isempty(tHit)
+        s = ts_last_scalar(ts);
+        return
+    end
+    ts = unwrap_signal(ts);
+    d = squeeze(ts_data(ts));
+    d = d(:);
+    if isempty(d)
+        s = nan;
+        return
+    end
+    if isa(ts, 'timeseries') && ~isempty(ts.Time)
+        [~, idx] = min(abs(ts.Time(:) - tHit));
+        idx = min(max(idx, 1), numel(d));
+        s = double(d(idx));
+    else
+        s = double(d(end));
+    end
+end
+
+function x = ts_vec_at_time(ts, n, tHit)
+    if isempty(tHit)
+        x = ts_last_vec(ts, n);
+        return
+    end
+    ts = unwrap_signal(ts);
+    d = ts_data(ts);
+    d = squeeze(d);
+    if isempty(d)
+        x = nan(n, 1);
+        return
+    end
+    idx = [];
+    if isa(ts, 'timeseries') && ~isempty(ts.Time)
+        [~, idx] = min(abs(ts.Time(:) - tHit));
+    end
+    if isvector(d)
+        x = ts_last_vec(ts, n);
+        return
+    elseif size(d, 1) == n
+        if isempty(idx) || idx > size(d, 2)
+            idx = size(d, 2);
+        end
+        x = d(:, idx);
+    elseif size(d, 2) == n
+        if isempty(idx) || idx > size(d, 1)
+            idx = size(d, 1);
+        end
+        x = d(idx, :).';
+    else
+        x = ts_last_vec(ts, n);
+        return
+    end
+    x = double(x(:));
+    if numel(x) < n
+        x(end+1:n, 1) = nan;
+    elseif numel(x) > n
+        x = x(1:n);
+    end
+end
+
+function s = num_at_time(obj, fieldName, tHit)
+    try
+        y = bus_field(obj, fieldName);
+        s = ts_scalar_at_time(y, tHit);
+    catch
+        s = nan;
+    end
+end
+
 function d = ts_data(ts)
     ts = unwrap_signal(ts);
     if isa(ts, 'timeseries')
@@ -789,7 +1003,7 @@ function save_char_figure(h, pngPath)
 end
 
 function print_alt_summary(results)
-    ok = results.converged;
+    ok = alt_points_on_map(results);
     nAll = numel(results.H_km);
     nOk = nnz(ok);
     fprintf('\n=== 高度扫描小结 ===\n');
@@ -806,13 +1020,21 @@ function print_alt_summary(results)
         return
     end
     Hok = results.H_km(ok);
-    fprintf('高度范围 %.2f～%.2f km。最高点 Fg = %.1f lbf，SFC = %.4f（按总推力）\n', ...
-        min(Hok), max(Hok), results.Fg_lbf(find(ok, 1, 'last')), ...
-        results.SFC_pph_lbf(find(ok, 1, 'last')));
+    iLast = find(ok, 1, 'last');
+    fprintf('高度范围 %.2f～%.2f km。最高点 NcMap = %.4f，Fn = %.1f lbf，SFC = %.4f（按净推力）\n', ...
+        min(Hok), max(Hok), results.NcMap(iLast), ...
+        results.Fn_lbf(iLast), results.SFC_pph_lbf(iLast));
+    [~, ncHi] = ncmap_limits(results);
+    if max(Hok) < 11
+        fprintf('未到 11 km：本机压气机图 NcMap 只到 %.2f，出图即停止，不按最高转速线外延。\n', ...
+            ncHi);
+    else
+        fprintf('已越过对流层顶（11 km），其上 Fs、SFC 应接近水平。\n');
+    end
 end
 
 function hFigs = plot_altitude(results)
-    ok = results.converged;
+    ok = alt_points_on_map(results);
     hFigs = gobjects(0);
     if ~any(ok)
         warning('ALTITUDE:NoPoints', '没有收敛点，无法画高度特性。');
@@ -822,17 +1044,6 @@ function hFigs = plot_altitude(results)
     Fg = results.Fg_lbf(ok);
     W = results.W_pps(ok);
     Wf = results.Wf_pps(ok);
-    if isfield(results, 'Fs_lbf_pps') && ~isempty(results.Fs_lbf_pps)
-        Fs = results.Fs_lbf_pps(ok);
-    else
-        Fs = Fg ./ W;
-    end
-    sfc = (3600 * Wf) ./ Fg;
-    [H, idx] = sort(H);
-    Fg = Fg(idx);
-    W = W(idx);
-    Fs = Fs(idx);
-    sfc = sfc(idx);
 
     mn = NaN;
     mode = '';
@@ -843,14 +1054,36 @@ function hFigs = plot_altitude(results)
     if ~isfinite(mn) && isfield(results, 'MN') && ~isempty(results.MN)
         mn = results.MN(find(ok, 1));
     end
-    ttl = sprintf('高度特性（Ma = %.2f，控制规律 %s，总推力 F_g）', mn, mode);
+
+    if isfinite(mn) && mn > 1e-6
+        Fn = Fg - ram_drag_lbf(W, mn, H);
+    elseif isfield(results, 'Fn_lbf') && ~isempty(results.Fn_lbf)
+        Fn = results.Fn_lbf(ok);
+    else
+        Fn = Fg;
+    end
+    Fs = Fn ./ W;
+    sfc = (3600 * Wf) ./ Fn;
+    if isfield(results, 'NcMap') && ~isempty(results.NcMap)
+        NcMap = results.NcMap(ok);
+    else
+        NcMap = nan(size(H));
+    end
+    [H, idx] = sort(H);
+    Fn = Fn(idx);
+    W = W(idx);
+    Fs = Fs(idx);
+    sfc = sfc(idx);
+    NcMap = NcMap(idx);
+
+    ttl = sprintf('高度特性（Ma = %.2f，控制规律 %s，净推力 F_n）', mn, mode);
     if strcmp(mode, 'T4') && isfield(results, 'meta') && isfield(results.meta, 'ThrottleTarget') ...
             && isfinite(results.meta.ThrottleTarget)
-        ttl = sprintf('高度特性（Ma = %.2f，T_4 = %.0f K 不变，总推力 F_g）', ...
+        ttl = sprintf('高度特性（Ma = %.2f，T_4 = %.0f K 不变，净推力 F_n）', ...
             mn, results.meta.ThrottleTarget * 5/9);
     end
 
-    xmax = max(15, ceil(max(H) + 0.01));
+    xmax = max(11, ceil(max(H) + 0.01));
     xt = 0:1:xmax;
 
     h1 = figure('Name', 'Altitude characteristic', 'Color', 'w');
@@ -862,16 +1095,16 @@ function hFigs = plot_altitude(results)
     grid on
     apply_H_axis(xmax, xt);
     ylabel('F_s  [lbf/(lbm/s)]');
-    title('单位推力（F_g / W）');
+    title('单位推力（F_n / W）');
 
     subplot(2, 2, 2);
-    plot(H, Fg, 'o-', 'LineWidth', 1.5);
+    plot(H, Fn, 'o-', 'LineWidth', 1.5);
     hold on
     plot_tropopause();
     grid on
     apply_H_axis(xmax, xt);
-    ylabel('F_g  [lbf]');
-    title('总推力');
+    ylabel('F_n  [lbf]');
+    title('净推力');
 
     subplot(2, 2, 3);
     plot(H, W, 'o-', 'LineWidth', 1.5);
@@ -889,10 +1122,67 @@ function hFigs = plot_altitude(results)
     grid on
     apply_H_axis(xmax, xt);
     ylabel('SFC  [lbm/h/lbf]');
-    title('耗油率（3600 W_f / F_g）');
+    title('耗油率（3600 W_f / F_n）');
     sgtitle(ttl);
 
-    hFigs = h1;
+    h2 = figure('Name', 'Altitude NcMap', 'Color', 'w');
+    plot(H, NcMap, 'o-', 'LineWidth', 1.5);
+    hold on
+    grid on
+    apply_H_axis(xmax, xt);
+    ylabel('N_{c,map}');
+    title('压气机换算转速');
+    [ncLo, ncHi] = ncmap_limits(results);
+    ylim([ncLo ncHi]);
+    yticks(ncLo:0.05:ncHi);
+    plot_tropopause();
+    if strcmp(mode, 'T4') && isfinite(mn)
+        subtitle(sprintf('Ma = %.2f，T_4 不变；纵坐标为特性图 %.2f～%.2f', ...
+            mn, ncLo, ncHi));
+    else
+        subtitle(sprintf('Ma = %.2f，控制规律 %s；纵坐标为特性图 %.2f～%.2f', ...
+            mn, mode, ncLo, ncHi));
+    end
+
+    hFigs = [h1; h2];
+end
+
+function ok = alt_points_on_map(results)
+    ok = logical(results.converged(:));
+    if ~isfield(results, 'NcMap') || isempty(results.NcMap)
+        return
+    end
+    [ncLo, ncHi] = ncmap_limits(results);
+    nc = results.NcMap(:);
+    n = min(numel(ok), numel(nc));
+    bad = false(size(ok));
+    bad(1:n) = ncmap_off_map(nc(1:n), ncLo, ncHi);
+    ok(bad) = false;
+end
+
+function [ncLo, ncHi] = ncmap_limits(results)
+    ncLo = 0.50;
+    ncHi = 1.05;
+    if nargin >= 1 && isstruct(results) && isfield(results, 'meta') ...
+            && isfield(results.meta, 'NcMapMin') && isfield(results.meta, 'NcMapMax') ...
+            && isfinite(results.meta.NcMapMin) && isfinite(results.meta.NcMapMax)
+        ncLo = results.meta.NcMapMin;
+        ncHi = results.meta.NcMapMax;
+    end
+end
+
+function [ncLo, ncHi] = hpc_ncmap_range(MWS)
+    ncLo = 0.50;
+    ncHi = 1.05;
+    if isstruct(MWS) && isfield(MWS, 'HPC') && isfield(MWS.HPC, 'NcVec') ...
+            && ~isempty(MWS.HPC.NcVec)
+        ncLo = min(MWS.HPC.NcVec(:));
+        ncHi = max(MWS.HPC.NcVec(:));
+    end
+end
+
+function tf = ncmap_off_map(nc, ncMin, ncMax)
+    tf = isfinite(nc) & (nc > ncMax + 1e-6 | nc < ncMin - 1e-6);
 end
 
 function apply_H_axis(xmax, xt)

@@ -19,8 +19,8 @@ function results = run_speed_char(varargin)
 %  若 HKm > 0：先在 Ma = 0 爬升到该高度并配平油门（不记入曲线），再扫 Ma。
 %
 %  按 0.10 往上扫马赫数；失败则对分，步长小于 dMNMin 则停止。
-%  图：单位推力 Fs=Fg/W、总推力 Fg、空气流量 W、耗油率 SFC=3600*Wf/Fg，均对马赫数。
-%  用喷管毛推力 Fg，不用净推力 Fn。图同时存 png 和 fig。
+%  图：单位推力 Fs=Fn/W、净推力 Fn、空气流量 W、耗油率 SFC=3600*Wf/Fn，均对马赫数。
+%  飞行特性用净推力 Fn = Fg − Fram（教材定义）。毛推力 Fg 仍写入结果。
 %  只重画：  results = run_speed_char('PlotOnly', true);
 %  退出时恢复高度、马赫数、燃油和 NR_IC；不要保存官方 mdl。
 
@@ -78,6 +78,12 @@ function results = run_speed_char(varargin)
     end
     MWS = evalin('base', 'MWS');
     NR_IC0 = MWS.Solve.NR_IC(:);
+    NR_dx0 = MWS.Solve.NR_dx;
+    HPC0 = MWS.HPC;
+    SimTime0 = MWS.in.SimTime;
+    MWS.HPC = pad_hpc_speed_lines(MWS.HPC, 1.12);
+    MWS.in.SimTime = max(SimTime0, 1000 * MWS.Solve.T);
+    assignin('base', 'MWS', MWS);
 
     if ~bdIsLoaded(mdl)
         load_system(mdl);
@@ -99,6 +105,7 @@ function results = run_speed_char(varargin)
     added_blocks = ensure_altitude_logs(mdl); %#ok<NASGU>
     cu = struct('mdl', mdl, 'wfBlk', wfBlk, 'solverBlk', solverBlk, ...
         'altBlk', altBlk, 'mnBlk', mnBlk, 'NR_IC0', NR_IC0, ...
+        'NR_dx0', NR_dx0, 'HPC0', HPC0, 'SimTime0', SimTime0, ...
         'Wf0_str', Wf0_str, 'Alt0_str', Alt0_str, 'MN0_str', MN0_str);
     cleanupObj = onCleanup(@() restore_altitude_cleanup(cu)); %#ok<NASGU>
 
@@ -106,11 +113,12 @@ function results = run_speed_char(varargin)
     results.meta.HKm = HKm;
     results.meta.MNMax = MNMax;
     results.meta.ThrottleMode = mode;
+    warnedMap = false;
 
     fprintf('\n=== 速度特性扫描 (H=%.2f km, 控制规律=%s, iDesign=2) ===\n', ...
         HKm, mode);
     fprintf('%7s  %7s  %8s  %8s  %8s  %8s  %8s  %6s  %s\n', ...
-        'Ma', 'Wf', 'W', 'NcMap', 'Fg', 'Fs', 'SFC', 'SM', 'status');
+        'Ma', 'Wf', 'W', 'NcMap', 'Fn', 'Fs', 'SFC', 'SM', 'status');
 
     fprintf('-- 0) 海平面静止锚点 Wf=%.2f，作为牛顿初值并取 T4 --\n', WfDes);
     [rowSLS, x_next, okSLS] = run_one_point(0, 0, WfDes, NR_IC0);
@@ -197,8 +205,10 @@ function results = run_speed_char(varargin)
             end
             Wf_g = Wf_out * ram_pt_ratio(mn_try) / ram_pt_ratio(mn_ok);
             Wf_g = min(max(Wf_g, WfMin), WfMax);
+            x_g = x_out(:);
+            x_g(1) = x_out(1) * ram_pt_ratio(mn_try) / ram_pt_ratio(mn_ok);
 
-            [~, x_try, Wf_try, ok] = trim_point(HKm, mn_try, Wf_g, x_out, true);
+            [~, x_try, Wf_try, ok] = trim_point(HKm, mn_try, Wf_g, x_g, true);
             if ok
                 mn_ok = mn_try;
                 x_out = x_try;
@@ -236,21 +246,31 @@ function results = run_speed_char(varargin)
             [row, x, conv] = run_one_point(H_km, mn, Wf, x);
             if ~conv
                 fprintf('%7.2f  %7.3f  -- 仿真未收敛 (trim %d)\n', mn, Wf, it);
+                if it < 8
+                    x = x_ic(:);
+                    if isfinite(Wf_prev)
+                        Wf = 0.5 * (Wf + Wf_prev);
+                    end
+                    continue
+                end
                 if store
-                    results = append_alt_result(results, row); %#ok<NASGU>
                     print_speed_row(row, 'NOT CONVERGED');
                 end
                 return
             end
-            if row.NcMap > 1.055 || row.NcMap < 0.495
-                fprintf(['%7.2f  %7.3f  -- NcMap=%.4f 超出特性图 0.50～1.05', ...
+            if row.NcMap > 1.12 || row.NcMap < 0.48
+                fprintf(['%7.2f  %7.3f  -- NcMap=%.4f 远离特性图 0.50～1.05', ...
                     ' (trim %d)\n'], mn, Wf, row.NcMap, it);
                 row.converged = false;
                 if store
-                    results = append_alt_result(results, row);
                     print_speed_row(row, 'OFF MAP');
                 end
                 return
+            end
+            if row.NcMap > 1.05 + 1e-6 && ~warnedMap
+                fprintf(['    注: 换算转速已超过特性图上界 1.05（本机图最高转速线）。', ...
+                    '插值按 1.05 封顶，T4 仍保持不变。\n']);
+                warnedMap = true;
             end
             [y, ~] = throttle_mismatch(row, mode, target);
             tol = throttle_tol(mode);
@@ -288,7 +308,6 @@ function results = run_speed_char(varargin)
             mn, mode, target, mode, throttle_meas(row, mode));
         row.converged = false;
         if store
-            results = append_alt_result(results, row);
             print_speed_row(row, 'TRIM FAIL');
         end
     end
@@ -306,8 +325,9 @@ function results = run_speed_char(varargin)
         set_param(solverBlk, 'SNR_IC_M', 'MWS.Solve.NR_IC');
 
         try
-            simOut = sim(mdl, 'ReturnWorkspaceOutputs', 'on', ...
-                'SrcWorkspace', 'base');
+            simOut = [];
+            evalc(['simOut = sim(mdl, ''ReturnWorkspaceOutputs'', ''on'', ', ...
+                '''SrcWorkspace'', ''base'');']);
         catch ME
             fprintf('%7.2f  -- 仿真出错: %s\n', mn, ME.message);
             return
@@ -323,7 +343,14 @@ function results = run_speed_char(varargin)
 
             x = ts_last_vec(NR_X, 4);
             Fg_end = ts_last_scalar(Fg);
-            ok = last_flag(Sdat, 'Converged');
+            idxC = last_true_index(Sdat, 'Converged');
+            ok = idxC > 0;
+            tHit = [];
+            if ok
+                tHit = ts_time_at(bus_field(Sdat, 'Converged'), idxC);
+                x = ts_vec_at_time(NR_X, 4, tHit);
+                Fg_end = ts_scalar_at_time(Fg, tHit);
+            end
 
             row.NR_X     = x.';
             row.W_pps    = x(1);
@@ -333,28 +360,37 @@ function results = run_speed_char(varargin)
             row.Fg_lbf   = Fg_end;
             row.Fg_N     = Fg_end * 4.4482216153;
             row.Fram_lbf = extract_fram(Adat, row.W_pps);
+            if ~(isfinite(row.Fram_lbf) && row.Fram_lbf > 0) && mn > 1e-6
+                row.Fram_lbf = ram_drag_lbf(row.W_pps, mn, H_km);
+            end
+            if ~isfinite(row.Fram_lbf)
+                row.Fram_lbf = ram_drag_lbf(row.W_pps, mn, H_km);
+            end
             row.Fn_lbf   = Fg_end - row.Fram_lbf;
             row.Fn_N     = row.Fn_lbf * 4.4482216153;
-            if isfinite(Fg_end) && Fg_end ~= 0
-                row.SFC_pph_lbf = 3600 * Wf / Fg_end;
-                row.SFC_kgN_s   = (Wf * 0.45359237) / row.Fg_N;
+            if isfinite(row.Fn_lbf) && row.Fn_lbf > 1e-6
+                row.SFC_pph_lbf = 3600 * Wf / row.Fn_lbf;
+                row.SFC_kgN_s   = (Wf * 0.45359237) / row.Fn_N;
             end
-            if isfinite(Fg_end) && isfinite(row.W_pps) && row.W_pps ~= 0
-                row.Fs_lbf_pps = Fg_end / row.W_pps;
-                row.Fs_N_kgs   = row.Fg_N / (row.W_pps * 0.45359237);
+            if isfinite(row.Fn_lbf) && isfinite(row.W_pps) && row.W_pps ~= 0
+                row.Fs_lbf_pps = row.Fn_lbf / row.W_pps;
+                row.Fs_N_kgs   = row.Fn_N / (row.W_pps * 0.45359237);
             end
             row.converged = ok;
-            row.PR_comp  = last_num(Cdat, 'PR');
-            row.SM_pct   = last_num(Cdat, 'SMavail');
-            row.Nc       = last_num(Cdat, 'Nc');
-            row.NcMap    = last_num(Cdat, 'NcMap');
+            row.PR_comp  = num_at_time(Cdat, 'PR', tHit);
+            row.SM_pct   = num_at_time(Cdat, 'SMavail', tHit);
+            row.Nc       = num_at_time(Cdat, 'Nc', tHit);
+            row.NcMap    = num_at_time(Cdat, 'NcMap', tHit);
             if ~isfinite(row.NcMap)
-                sNc = last_num_soft(Cdat, 's_C_Nc');
+                sNc = num_at_time(Cdat, 's_C_Nc', tHit);
+                if ~isfinite(sNc)
+                    sNc = last_num_soft(Cdat, 's_C_Nc');
+                end
                 if isfinite(sNc) && sNc ~= 0 && isfinite(row.Nc)
                     row.NcMap = row.Nc / sNc;
                 end
             end
-            row.Tt4_R = last_num(s4, 'Tt');
+            row.Tt4_R = num_at_time(s4, 'Tt', tHit);
             if ok
                 x_out = x(:);
             end
@@ -371,6 +407,15 @@ function restore_altitude_cleanup(cu)
         if evalin('base', 'exist(''MWS'',''var'')') == 1
             MWSb = evalin('base', 'MWS');
             MWSb.Solve.NR_IC = cu.NR_IC0;
+            if isfield(cu, 'NR_dx0') && isfinite(cu.NR_dx0)
+                MWSb.Solve.NR_dx = cu.NR_dx0;
+            end
+            if isfield(cu, 'HPC0') && ~isempty(cu.HPC0)
+                MWSb.HPC = cu.HPC0;
+            end
+            if isfield(cu, 'SimTime0') && isfinite(cu.SimTime0)
+                MWSb.in.SimTime = cu.SimTime0;
+            end
             assignin('base', 'MWS', MWSb);
         end
         if bdIsLoaded(cu.mdl)
@@ -455,7 +500,7 @@ end
 
 function print_speed_row(row, flag)
     fprintf('%7.2f  %7.3f  %8.2f  %8.4f  %8.1f  %8.2f  %8.4f  %6.2f  %s\n', ...
-        row.MN, row.Wf_pps, row.W_pps, row.NcMap, row.Fg_lbf, ...
+        row.MN, row.Wf_pps, row.W_pps, row.NcMap, row.Fn_lbf, ...
         row.Fs_lbf_pps, row.SFC_pph_lbf, row.SM_pct, flag);
 end
 
@@ -578,6 +623,22 @@ end
 
 function ft = km2ft(km)
     ft = km * 3280.839895;
+end
+
+function T_R = isa_T_R(h_km)
+    T_K = 216.65 * ones(size(h_km));
+    inTrop = h_km < 11;
+    T_K(inTrop) = 288.15 - 6.5 * h_km(inTrop);
+    T_R = T_K * 9/5;
+end
+
+function Fram = ram_drag_lbf(W, mn, h_km)
+    if nargin < 3 || isempty(h_km)
+        h_km = 0;
+    end
+    a = 1116.4505 * sqrt(isa_T_R(h_km) / 518.67);
+    Fram = W .* (mn .* a) / 32.174;
+    Fram(~isfinite(mn) | mn <= 0) = 0;
 end
 
 function ps = tmats_ps_psi(h_ft)
@@ -763,6 +824,122 @@ function s = ts_last_scalar(ts)
     s = double(d(end));
 end
 
+function idx = last_true_index(obj, fieldName)
+    idx = 0;
+    try
+        y = bus_field(obj, fieldName);
+        d = squeeze(ts_data(y));
+        d = d(:);
+        hit = find(d > 0.5, 1, 'last');
+        if ~isempty(hit)
+            idx = hit;
+        end
+    catch
+    end
+end
+
+function t = ts_time_at(ts, idx)
+    t = [];
+    ts = unwrap_signal(ts);
+    try
+        if isa(ts, 'timeseries') && idx >= 1 && idx <= numel(ts.Time)
+            t = ts.Time(idx);
+        end
+    catch
+    end
+end
+
+function s = ts_scalar_at_time(ts, tHit)
+    if isempty(tHit)
+        s = ts_last_scalar(ts);
+        return
+    end
+    ts = unwrap_signal(ts);
+    d = squeeze(ts_data(ts));
+    d = d(:);
+    if isempty(d)
+        s = nan;
+        return
+    end
+    if isa(ts, 'timeseries') && ~isempty(ts.Time)
+        [~, idx] = min(abs(ts.Time(:) - tHit));
+        idx = min(max(idx, 1), numel(d));
+        s = double(d(idx));
+    else
+        s = double(d(end));
+    end
+end
+
+function x = ts_vec_at_time(ts, n, tHit)
+    if isempty(tHit)
+        x = ts_last_vec(ts, n);
+        return
+    end
+    ts = unwrap_signal(ts);
+    d = ts_data(ts);
+    d = squeeze(d);
+    if isempty(d)
+        x = nan(n, 1);
+        return
+    end
+    idx = [];
+    if isa(ts, 'timeseries') && ~isempty(ts.Time)
+        [~, idx] = min(abs(ts.Time(:) - tHit));
+    end
+    if isvector(d)
+        x = ts_last_vec(ts, n);
+        return
+    elseif size(d, 1) == n
+        if isempty(idx) || idx > size(d, 2)
+            idx = size(d, 2);
+        end
+        x = d(:, idx);
+    elseif size(d, 2) == n
+        if isempty(idx) || idx > size(d, 1)
+            idx = size(d, 1);
+        end
+        x = d(idx, :).';
+    else
+        x = ts_last_vec(ts, n);
+        return
+    end
+    x = double(x(:));
+    if numel(x) < n
+        x(end+1:n, 1) = nan;
+    elseif numel(x) > n
+        x = x(1:n);
+    end
+end
+
+function s = num_at_time(obj, fieldName, tHit)
+    try
+        y = bus_field(obj, fieldName);
+        s = ts_scalar_at_time(y, tHit);
+    catch
+        s = nan;
+    end
+end
+
+function HPC = pad_hpc_speed_lines(HPC, ncMax)
+    nc = HPC.NcVec(:).';
+    add = (nc(end) + 0.025):0.025:ncMax;
+    add = add(add > nc(end) + 1e-9);
+    if isempty(add)
+        return
+    end
+    nAdd = numel(add);
+    HPC.NcVec = [nc, add];
+    HPC.WcArray  = [HPC.WcArray;  repmat(HPC.WcArray(end, :),  nAdd, 1)];
+    HPC.EffArray = [HPC.EffArray; repmat(HPC.EffArray(end, :), nAdd, 1)];
+    HPC.PRArray  = [HPC.PRArray;  repmat(HPC.PRArray(end, :),  nAdd, 1)];
+    if isfield(HPC, 'WcMapSurge') && ~isempty(HPC.WcMapSurge)
+        HPC.WcMapSurge = [HPC.WcMapSurge(:).', repmat(HPC.WcMapSurge(end), 1, nAdd)];
+    end
+    if isfield(HPC, 'PRMapSurge') && ~isempty(HPC.PRMapSurge)
+        HPC.PRMapSurge = [HPC.PRMapSurge(:).', repmat(HPC.PRMapSurge(end), 1, nAdd)];
+    end
+end
+
 function d = ts_data(ts)
     ts = unwrap_signal(ts);
     if isa(ts, 'timeseries')
@@ -816,8 +993,8 @@ function print_speed_summary(results)
         return
     end
     Mok = results.MN(ok);
-    fprintf('马赫数范围 %.2f～%.2f。最高 Ma 点 Fg = %.1f lbf，SFC = %.4f（按总推力）\n', ...
-        min(Mok), max(Mok), results.Fg_lbf(find(ok, 1, 'last')), ...
+    fprintf('马赫数范围 %.2f～%.2f。最高 Ma 点 Fn = %.1f lbf，SFC = %.4f（按净推力）\n', ...
+        min(Mok), max(Mok), results.Fn_lbf(find(ok, 1, 'last')), ...
         results.SFC_pph_lbf(find(ok, 1, 'last')));
 end
 
@@ -832,17 +1009,6 @@ function hFigs = plot_speed(results)
     Fg = results.Fg_lbf(ok);
     W = results.W_pps(ok);
     Wf = results.Wf_pps(ok);
-    if isfield(results, 'Fs_lbf_pps') && ~isempty(results.Fs_lbf_pps)
-        Fs = results.Fs_lbf_pps(ok);
-    else
-        Fs = Fg ./ W;
-    end
-    sfc = (3600 * Wf) ./ Fg;
-    [M, idx] = sort(M);
-    Fg = Fg(idx);
-    W = W(idx);
-    Fs = Fs(idx);
-    sfc = sfc(idx);
 
     Hkm = NaN;
     mode = '';
@@ -855,10 +1021,19 @@ function hFigs = plot_speed(results)
     if ~isfinite(Hkm) && isfield(results, 'H_km') && ~isempty(results.H_km)
         Hkm = results.H_km(find(ok, 1));
     end
-    ttl = sprintf('速度特性（H = %.2f km，控制规律 %s，总推力 F_g）', Hkm, mode);
+    Fn = Fg - ram_drag_lbf(W, M, Hkm);
+    Fs = Fn ./ W;
+    sfc = (3600 * Wf) ./ Fn;
+    [M, idx] = sort(M);
+    Fn = Fn(idx);
+    W = W(idx);
+    Fs = Fs(idx);
+    sfc = sfc(idx);
+
+    ttl = sprintf('速度特性（H = %.2f km，控制规律 %s，净推力 F_n）', Hkm, mode);
     if strcmp(mode, 'T4') && isfield(results, 'meta') && isfield(results.meta, 'ThrottleTarget') ...
             && isfinite(results.meta.ThrottleTarget)
-        ttl = sprintf('速度特性（H = %.2f km，T_4 = %.0f K 不变，总推力 F_g）', ...
+        ttl = sprintf('速度特性（H = %.2f km，T_4 = %.0f K 不变，净推力 F_n）', ...
             Hkm, results.meta.ThrottleTarget * 5/9);
     end
 
@@ -872,14 +1047,14 @@ function hFigs = plot_speed(results)
     grid on
     apply_MN_axis(xmax, xt);
     ylabel('F_s  [lbf/(lbm/s)]');
-    title('单位推力（F_g / W）');
+    title('单位推力（F_n / W）');
 
     subplot(2, 2, 2);
-    plot(M, Fg, 'o-', 'LineWidth', 1.5);
+    plot(M, Fn, 'o-', 'LineWidth', 1.5);
     grid on
     apply_MN_axis(xmax, xt);
-    ylabel('F_g  [lbf]');
-    title('总推力');
+    ylabel('F_n  [lbf]');
+    title('净推力');
 
     subplot(2, 2, 3);
     plot(M, W, 'o-', 'LineWidth', 1.5);
@@ -893,7 +1068,7 @@ function hFigs = plot_speed(results)
     grid on
     apply_MN_axis(xmax, xt);
     ylabel('SFC  [lbm/h/lbf]');
-    title('耗油率（3600 W_f / F_g）');
+    title('耗油率（3600 W_f / F_n）');
     sgtitle(ttl);
 
     hFigs = h1;

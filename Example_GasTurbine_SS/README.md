@@ -43,7 +43,7 @@ GasTurbine_SS_setup_everything
 
 ## 地面节流特性
 
-`run_throttle_char.m` 在 **H = 0、Ma = 0、几何冻结** 下扫燃油。图上用喷管**总推力（毛推力）** \(F_g\)；地面静止时冲压阻力为零，\(F_n=F_g\)。耗油率为 \(\mathrm{SFC}=3600 W_f/F_g\)。
+`run_throttle_char.m` 在 **H = 0、Ma = 0、几何冻结** 下扫燃油。图上用**净推力** \(F_n=F_g-F_{\mathrm{ram}}\)；地面静止时冲压阻力为零，\(F_n=F_g\)。耗油率为 \(\mathrm{SFC}=3600 W_f/F_n\)。
 
 ```matlab
 % 先 setup，确认 Compressor / Turbine / Nozzle 的 iDesign = 2
@@ -53,8 +53,8 @@ results = run_throttle_char;
 默认从设计点 3.00 pps 往下收油，直到不收敛或碰到燃油下限。结果覆盖写入：
 
 - `throttle_char_results.mat`
-- `throttle_char.png` / `.fig`（总推力 \(F_g\)、SFC 对压气机图换算转速 \(N_{c,\mathrm{map}}\)）
-- `throttle_char_sfc_vs_fg.png` / `.fig`（SFC 对总推力 \(F_g\)）
+- `throttle_char.png` / `.fig`（净推力 \(F_n\)、SFC 对压气机图换算转速 \(N_{c,\mathrm{map}}\)）
+- `throttle_char_sfc_vs_fn.png` / `.fig`（SFC 对净推力 \(F_n\)）
 - `throttle_char_ops.png` / `.fig`（燃油、喘振裕度、\(T_4\)、R-line）
 
 在 MATLAB 里请打开 **`.fig`**（当前文件夹双击，或 `openfig('throttle_char.fig')`）。png 方便插入文档。
@@ -73,7 +73,9 @@ results = run_throttle_char('PlotOnly', true);
 
 ## 高度特性
 
-`run_altitude_char.m` 在 **几何冻结、Ma 固定、\(T_4\) 不变** 下扫高度。图上用喷管**总推力（毛推力）** \(F_g\)，不用净推力。四张子图为：单位推力 \(F_s=F_g/W\)、总推力 \(F_g\)、空气流量 \(W\)、耗油率 \(\mathrm{SFC}=3600 W_f/F_g\)。
+`run_altitude_char.m` 在 **几何冻结、Ma 固定、\(T_4\) 不变** 下扫高度。默认先在海平面按 **0.1** 把马赫数从 0 升到 0.9 并配平（不记入曲线），再扫高度。图上用**净推力** \(F_n=F_g-F_{\mathrm{ram}}\)（教材定义），不是喷管毛推力。四张子图为：单位推力 \(F_s=F_n/W\)、净推力 \(F_n\)、空气流量 \(W\)、耗油率 \(\mathrm{SFC}=3600 W_f/F_n\)。另存一张 **压气机换算转速 \(N_{c,\mathrm{map}}\) 随高度**。Ma = 0.9 时冲压阻力不可忽略：若误用 \(F_g\) 算 SFC，对流层内会随高度上升，与教材相反。
+
+本机压气机图 \(N_{c,\mathrm{map}}\) 只到 1.05。\(T_4\) 不变爬高时换算转速升高，出图即停止，**不按最高转速线外延**去强行扫到 11 km。
 
 ```matlab
 results = run_altitude_char;
@@ -94,7 +96,7 @@ results = run_altitude_char('ThrottleMode', 'N');      % N = 10000 rpm
 
 钉死物理转速时，高空变冷后换算转速升高，本机压气机图大约只到 1.05，往往扫不高。
 
-结果覆盖写入 `altitude_char_results.mat`、`altitude_char.png` / `.fig`。只重画：
+结果覆盖写入 `altitude_char_results.mat`、`altitude_char.png` / `.fig`、`altitude_char_ncmap.png` / `.fig`。只重画：
 
 ```matlab
 results = run_altitude_char('PlotOnly', true);
@@ -102,7 +104,7 @@ results = run_altitude_char('PlotOnly', true);
 
 ## 速度特性
 
-`run_speed_char.m` 在 **几何冻结、高度固定、\(T_4\) 不变** 下扫马赫数。图同样是 \(F_s\)、\(F_g\)、\(W\)、SFC，横轴为 Ma。
+`run_speed_char.m` 在 **几何冻结、高度固定、\(T_4\) 不变** 下扫马赫数。图同样用净推力：\(F_s\)、\(F_n\)、\(W\)、SFC，横轴为 Ma。
 
 ```matlab
 results = run_speed_char;
