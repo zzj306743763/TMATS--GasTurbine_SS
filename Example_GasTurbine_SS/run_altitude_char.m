@@ -21,7 +21,7 @@ function results = run_altitude_char(varargin)
 %  失败则对分；小步成功后先补上尚未越过的失败高度，不把步长立刻恢复成 1 km。
 %  步长小于 dHMin 则停止。换算转速超出压气机图转速线范围即结束，不外延。
 %  图：Fs、Fn、W、SFC 对高度；另存 NcMap 随高度。
-%  飞行特性用净推力 Fn = Fg − Fram（教材定义）。毛推力 Fg 仍写入结果。
+%  飞行特性用净推力 Fn = Fg − Fram（教材定义）。总推力 Fg 仍写入结果。
 %  Ma>0 时若用 Fg 算 SFC，对流层内会随高度上升，与教材相反。
 %  只重画：  results = run_altitude_char('PlotOnly', true);
 %  退出时恢复高度、马赫数、燃油和 NR_IC；不要保存官方 mdl。

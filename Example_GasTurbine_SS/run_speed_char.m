@@ -14,12 +14,14 @@ function results = run_speed_char(varargin)
 %  本模型油门是燃油常数、转速由牛顿法求出，所以每一马赫数微调 Wf 去钉住 T4。
 %  仍可改 ThrottleMode：'T4'（默认）| 'NcMap' | 'N'。
 %
-%  默认 H = 0 km，Ma 从 0 扫到 1.2。高空速度特性用：
+%  默认 H = 0 km，Ma 从 0 扫到 2.5。高空速度特性用：
 %    results = run_speed_char('HKm', 11);
 %  若 HKm > 0：先在 Ma = 0 爬升到该高度并配平油门（不记入曲线），再扫 Ma。
 %
-%  按 0.10 往上扫马赫数；失败则对分，步长小于 dMNMin 则停止。
-%  图：单位推力 Fs=Fn/W、净推力 Fn、空气流量 W、耗油率 SFC=3600*Wf/Fn，均对马赫数。
+%  按 0.05 往上扫马赫数；失败则对分，步长小于 dMNMin 则停止。
+%  小步成功后先补上尚未越过的失败马赫，不把步长立刻恢复成 0.05。
+%  换算转速超出压气机图转速线范围即结束，不外延。
+%  图：Fs、Fn、W、SFC 对马赫数。
 %  飞行特性用净推力 Fn = Fg − Fram（教材定义）。毛推力 Fg 仍写入结果。
 %  只重画：  results = run_speed_char('PlotOnly', true);
 %  退出时恢复高度、马赫数、燃油和 NR_IC；不要保存官方 mdl。
@@ -28,14 +30,14 @@ function results = run_speed_char(varargin)
     addParameter(p, 'Model', 'GasTurbine_SS_Template', @ischar);
     addParameter(p, 'HKm', 0, @isnumeric);
     addParameter(p, 'dHKm', 1.0, @isnumeric);
-    addParameter(p, 'MNMax', 1.20, @isnumeric);
-    addParameter(p, 'dMN', 0.10, @isnumeric);
-    addParameter(p, 'dMNMin', 0.05, @isnumeric);
+    addParameter(p, 'MNMax', 2.50, @isnumeric);
+    addParameter(p, 'dMN', 0.05, @isnumeric);
+    addParameter(p, 'dMNMin', 0.025, @isnumeric);
     addParameter(p, 'WfDes', 3.00, @isnumeric);
     addParameter(p, 'ThrottleMode', 'T4', @ischar);
     addParameter(p, 'ThrottleTarget', nan, @isnumeric);
     addParameter(p, 'WfMin', 0.05, @isnumeric);
-    addParameter(p, 'WfMax', 4.00, @isnumeric);
+    addParameter(p, 'WfMax', 8.00, @isnumeric);
     addParameter(p, 'SaveFig', true, @islogical);
     addParameter(p, 'PlotOnly', false, @islogical);
     parse(p, varargin{:});
@@ -79,9 +81,8 @@ function results = run_speed_char(varargin)
     MWS = evalin('base', 'MWS');
     NR_IC0 = MWS.Solve.NR_IC(:);
     NR_dx0 = MWS.Solve.NR_dx;
-    HPC0 = MWS.HPC;
     SimTime0 = MWS.in.SimTime;
-    MWS.HPC = pad_hpc_speed_lines(MWS.HPC, 1.12);
+    [ncMapMin, ncMapMax] = hpc_ncmap_range(MWS);
     MWS.in.SimTime = max(SimTime0, 1000 * MWS.Solve.T);
     assignin('base', 'MWS', MWS);
 
@@ -105,7 +106,7 @@ function results = run_speed_char(varargin)
     added_blocks = ensure_altitude_logs(mdl); %#ok<NASGU>
     cu = struct('mdl', mdl, 'wfBlk', wfBlk, 'solverBlk', solverBlk, ...
         'altBlk', altBlk, 'mnBlk', mnBlk, 'NR_IC0', NR_IC0, ...
-        'NR_dx0', NR_dx0, 'HPC0', HPC0, 'SimTime0', SimTime0, ...
+        'NR_dx0', NR_dx0, 'SimTime0', SimTime0, ...
         'Wf0_str', Wf0_str, 'Alt0_str', Alt0_str, 'MN0_str', MN0_str);
     cleanupObj = onCleanup(@() restore_altitude_cleanup(cu)); %#ok<NASGU>
 
@@ -113,7 +114,9 @@ function results = run_speed_char(varargin)
     results.meta.HKm = HKm;
     results.meta.MNMax = MNMax;
     results.meta.ThrottleMode = mode;
-    warnedMap = false;
+    results.meta.dMN = dMN;
+    results.meta.NcMapMin = ncMapMin;
+    results.meta.NcMapMax = ncMapMax;
 
     fprintf('\n=== 速度特性扫描 (H=%.2f km, 控制规律=%s, iDesign=2) ===\n', ...
         HKm, mode);
@@ -196,27 +199,49 @@ function results = run_speed_char(varargin)
         x_out = x_ok;
         Wf_out = Wf_ok;
         d = dNom;
+        mn_block = inf;
         nGuard = 0;
-        while nGuard < 80 && mn_ok < mnMax - 1e-9
+        while nGuard < 200 && mn_ok < mnMax - 1e-9
             nGuard = nGuard + 1;
             mn_try = round(mn_ok + d, 4);
+            if isfinite(mn_block)
+                mn_try = min(mn_try, mn_block);
+            end
             if mn_try > mnMax + 1e-9
                 mn_try = mnMax;
+            end
+            if mn_try <= mn_ok + 1e-9
+                fprintf('    与上一成功点 Ma=%.2f 的间隔已无法再分，停止加速。\n', mn_ok);
+                break
             end
             Wf_g = Wf_out * ram_pt_ratio(mn_try) / ram_pt_ratio(mn_ok);
             Wf_g = min(max(Wf_g, WfMin), WfMax);
             x_g = x_out(:);
             x_g(1) = x_out(1) * ram_pt_ratio(mn_try) / ram_pt_ratio(mn_ok);
 
-            [~, x_try, Wf_try, ok] = trim_point(HKm, mn_try, Wf_g, x_g, true);
+            [~, x_try, Wf_try, ok, why] = trim_point(HKm, mn_try, Wf_g, x_g, true);
             if ok
                 mn_ok = mn_try;
                 x_out = x_try;
                 Wf_out = Wf_try;
-                d = dNom;
+                if mn_ok + 1e-9 >= mn_block
+                    mn_block = inf;
+                    d = dNom;
+                else
+                    d = min(dNom, mn_block - mn_ok);
+                end
                 continue
             end
+            if strcmp(why, 'offmap')
+                fprintf('    超出压气机特性图范围，速度扫描结束（不外延）。\n');
+                break
+            end
+            if strcmp(why, 'wfmax')
+                fprintf('    燃油已到上限，无法再钉住 T4，速度扫描结束。\n');
+                break
+            end
 
+            mn_block = min(mn_block, mn_try);
             mn_mid = round(0.5 * (mn_ok + mn_try), 4);
             step = mn_mid - mn_ok;
             if step < dMin - 1e-12
@@ -233,11 +258,12 @@ function results = run_speed_char(varargin)
         end
     end
 
-    function [row, x_out, Wf_out, ok] = trim_point(H_km, mn, Wf_g, x_ic, store)
+    function [row, x_out, Wf_out, ok, why] = trim_point(H_km, mn, Wf_g, x_ic, store)
         row = blank_alt_row(H_km, mn, Wf_g);
         x_out = x_ic(:);
         Wf_out = Wf_g;
         ok = false;
+        why = 'fail';
         Wf = min(max(Wf_g, WfMin), WfMax);
         x = x_ic(:);
         Wf_prev = nan;
@@ -250,27 +276,26 @@ function results = run_speed_char(varargin)
                     x = x_ic(:);
                     if isfinite(Wf_prev)
                         Wf = 0.5 * (Wf + Wf_prev);
+                    else
+                        Wf = min(max(Wf * 0.92, WfMin), WfMax);
                     end
                     continue
                 end
                 if store
                     print_speed_row(row, 'NOT CONVERGED');
                 end
+                why = 'nr';
                 return
             end
-            if row.NcMap > 1.12 || row.NcMap < 0.48
-                fprintf(['%7.2f  %7.3f  -- NcMap=%.4f 远离特性图 0.50～1.05', ...
-                    ' (trim %d)\n'], mn, Wf, row.NcMap, it);
+            if ncmap_off_map(row.NcMap, ncMapMin, ncMapMax)
+                fprintf(['%7.2f  %7.3f  -- NcMap=%.4f 超出特性图 %.2f～%.2f，停止。\n'], ...
+                    mn, Wf, row.NcMap, ncMapMin, ncMapMax);
                 row.converged = false;
                 if store
                     print_speed_row(row, 'OFF MAP');
                 end
+                why = 'offmap';
                 return
-            end
-            if row.NcMap > 1.05 + 1e-6 && ~warnedMap
-                fprintf(['    注: 换算转速已超过特性图上界 1.05（本机图最高转速线）。', ...
-                    '插值按 1.05 封顶，T4 仍保持不变。\n']);
-                warnedMap = true;
             end
             [y, ~] = throttle_mismatch(row, mode, target);
             tol = throttle_tol(mode);
@@ -278,6 +303,7 @@ function results = run_speed_char(varargin)
                 Wf_out = Wf;
                 x_out = x;
                 ok = true;
+                why = '';
                 row.converged = true;
                 if store
                     results = append_alt_result(results, row);
@@ -306,7 +332,27 @@ function results = run_speed_char(varargin)
         end
         fprintf('%7.2f  -- 油门未配平到 %s=%.4g（最后 %s=%.4g）\n', ...
             mn, mode, target, mode, throttle_meas(row, mode));
+        if strcmp(mode, 'T4')
+            fprintf('         （T4 目标 %.1f K，最后 %.1f K；Wf = %.3f pps，上限 %.2f）\n', ...
+                target * 5/9, throttle_meas(row, mode) * 5/9, Wf, WfMax);
+        end
         row.converged = false;
+        if ncmap_off_map(row.NcMap, ncMapMin, ncMapMax)
+            if store
+                print_speed_row(row, 'OFF MAP');
+            end
+            why = 'offmap';
+            return
+        end
+        if strcmp(mode, 'T4') && Wf >= WfMax - 1e-6 ...
+                && throttle_meas(row, mode) < target - throttle_tol(mode)
+            if store
+                print_speed_row(row, 'WF MAX');
+            end
+            why = 'wfmax';
+            return
+        end
+        why = 'trim';
         if store
             print_speed_row(row, 'TRIM FAIL');
         end
@@ -359,13 +405,7 @@ function results = run_speed_char(varargin)
             row.N_rpm    = x(4);
             row.Fg_lbf   = Fg_end;
             row.Fg_N     = Fg_end * 4.4482216153;
-            row.Fram_lbf = extract_fram(Adat, row.W_pps);
-            if ~(isfinite(row.Fram_lbf) && row.Fram_lbf > 0) && mn > 1e-6
-                row.Fram_lbf = ram_drag_lbf(row.W_pps, mn, H_km);
-            end
-            if ~isfinite(row.Fram_lbf)
-                row.Fram_lbf = ram_drag_lbf(row.W_pps, mn, H_km);
-            end
+            row.Fram_lbf = ram_drag_lbf(row.W_pps, mn, H_km);
             row.Fn_lbf   = Fg_end - row.Fram_lbf;
             row.Fn_N     = row.Fn_lbf * 4.4482216153;
             if isfinite(row.Fn_lbf) && row.Fn_lbf > 1e-6
@@ -409,9 +449,6 @@ function restore_altitude_cleanup(cu)
             MWSb.Solve.NR_IC = cu.NR_IC0;
             if isfield(cu, 'NR_dx0') && isfinite(cu.NR_dx0)
                 MWSb.Solve.NR_dx = cu.NR_dx0;
-            end
-            if isfield(cu, 'HPC0') && ~isempty(cu.HPC0)
-                MWSb.HPC = cu.HPC0;
             end
             if isfield(cu, 'SimTime0') && isfinite(cu.SimTime0)
                 MWSb.in.SimTime = cu.SimTime0;
@@ -529,7 +566,7 @@ function tol = throttle_tol(mode)
         case 'N'
             tol = 40;
         case 'T4'
-            tol = 20;
+            tol = 2;
         otherwise
             tol = inf;
     end
@@ -920,26 +957,6 @@ function s = num_at_time(obj, fieldName, tHit)
     end
 end
 
-function HPC = pad_hpc_speed_lines(HPC, ncMax)
-    nc = HPC.NcVec(:).';
-    add = (nc(end) + 0.025):0.025:ncMax;
-    add = add(add > nc(end) + 1e-9);
-    if isempty(add)
-        return
-    end
-    nAdd = numel(add);
-    HPC.NcVec = [nc, add];
-    HPC.WcArray  = [HPC.WcArray;  repmat(HPC.WcArray(end, :),  nAdd, 1)];
-    HPC.EffArray = [HPC.EffArray; repmat(HPC.EffArray(end, :), nAdd, 1)];
-    HPC.PRArray  = [HPC.PRArray;  repmat(HPC.PRArray(end, :),  nAdd, 1)];
-    if isfield(HPC, 'WcMapSurge') && ~isempty(HPC.WcMapSurge)
-        HPC.WcMapSurge = [HPC.WcMapSurge(:).', repmat(HPC.WcMapSurge(end), 1, nAdd)];
-    end
-    if isfield(HPC, 'PRMapSurge') && ~isempty(HPC.PRMapSurge)
-        HPC.PRMapSurge = [HPC.PRMapSurge(:).', repmat(HPC.PRMapSurge(end), 1, nAdd)];
-    end
-end
-
 function d = ts_data(ts)
     ts = unwrap_signal(ts);
     if isa(ts, 'timeseries')
@@ -1021,7 +1038,13 @@ function hFigs = plot_speed(results)
     if ~isfinite(Hkm) && isfield(results, 'H_km') && ~isempty(results.H_km)
         Hkm = results.H_km(find(ok, 1));
     end
-    Fn = Fg - ram_drag_lbf(W, M, Hkm);
+    if isfinite(Hkm) && ~isempty(M)
+        Fn = Fg - ram_drag_lbf(W, M, Hkm);
+    elseif isfield(results, 'Fn_lbf') && ~isempty(results.Fn_lbf)
+        Fn = results.Fn_lbf(ok);
+    else
+        Fn = Fg;
+    end
     Fs = Fn ./ W;
     sfc = (3600 * Wf) ./ Fn;
     [M, idx] = sort(M);
@@ -1037,8 +1060,13 @@ function hFigs = plot_speed(results)
             Hkm, results.meta.ThrottleTarget * 5/9);
     end
 
-    xmax = max(1.2, ceil((max(M) + 0.001) * 10) / 10);
-    xt = 0:0.1:xmax;
+    xmax = 2.5;
+    if isfield(results, 'meta') && isfield(results.meta, 'MNMax') ...
+            && isfinite(results.meta.MNMax)
+        xmax = results.meta.MNMax;
+    end
+    xmax = max(xmax, ceil((max(M) + 0.001) * 10) / 10);
+    xt = 0:0.2:xmax;
 
     h1 = figure('Name', 'Speed characteristic', 'Color', 'w');
 
@@ -1082,4 +1110,18 @@ end
 
 function r = ram_pt_ratio(mn)
     r = (1 + 0.2 * mn.^2).^3.5;
+end
+
+function [ncLo, ncHi] = hpc_ncmap_range(MWS)
+    ncLo = 0.50;
+    ncHi = 1.05;
+    if isstruct(MWS) && isfield(MWS, 'HPC') && isfield(MWS.HPC, 'NcVec') ...
+            && ~isempty(MWS.HPC.NcVec)
+        ncLo = min(MWS.HPC.NcVec(:));
+        ncHi = max(MWS.HPC.NcVec(:));
+    end
+end
+
+function tf = ncmap_off_map(nc, ncMin, ncMax)
+    tf = isfinite(nc) & (nc > ncMax + 1e-6 | nc < ncMin - 1e-6);
 end

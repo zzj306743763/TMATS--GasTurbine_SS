@@ -104,13 +104,13 @@ results = run_altitude_char('PlotOnly', true);
 
 ## 速度特性
 
-`run_speed_char.m` 在 **几何冻结、高度固定、\(T_4\) 不变** 下扫马赫数。图同样用净推力：\(F_s\)、\(F_n\)、\(W\)、SFC，横轴为 Ma。
+`run_speed_char.m` 在 **几何冻结、高度固定、\(T_4\) 不变** 下扫马赫数。默认步长 **0.05**，Ma 从 0 扫到 **2.5**。图同样用净推力：\(F_s\)、\(F_n\)、\(W\)、SFC，横轴为 Ma。净推力 \(F_n=F_g-W V_0/g_c\)（教材冲压阻力）。超出压气机图转速范围或燃油上限即停止，不外延。
 
 ```matlab
 results = run_speed_char;
 ```
 
-默认 H = 0 km，Ma 从 0 扫到 1.2。高空速度特性先在 Ma = 0 爬升到指定高度（不记入曲线），再扫 Ma：
+默认 H = 0 km，Ma 从 0 扫到 2.5。高空速度特性先在 Ma = 0 爬升到指定高度（不记入曲线），再扫 Ma：
 
 ```matlab
 results = run_speed_char('HKm', 11);
