@@ -41,6 +41,16 @@ GasTurbine_SS_setup_everything
 
 **不要把官方 mdl 存盘。** 特性扫描脚本只会临时加记录模块，退出时会删掉。
 
+三条教材特性（须先 `setup`，且 Compressor / Turbine / Nozzle 的 `iDesign = 2`）：
+
+```matlab
+results = run_throttle_char;    % 地面节流：H=0、Ma=0，扫燃油
+results = run_altitude_char;    % 高度特性：默认 Ma=0.9、T4 不变，扫高度
+results = run_speed_char;       % 速度特性：默认 H=0、T4 不变，扫马赫数
+```
+
+静止高度特性（Ma = 0）用 `run_altitude_char('MN', 0)`。已有 `.mat` 时，三个脚本都可用 `'PlotOnly', true` 只重画、不重算。
+
 ## 地面节流特性
 
 `run_throttle_char.m` 在 **H = 0、Ma = 0、几何冻结** 下扫燃油。图上用**净推力** \(F_n=F_g-F_{\mathrm{ram}}\)；地面静止时冲压阻力为零，\(F_n=F_g\)。耗油率为 \(\mathrm{SFC}=3600 W_f/F_n\)。
@@ -69,58 +79,129 @@ results = run_throttle_char('PlotOnly', true);
 
 ## 飞行特性的控制规律
 
-速度特性和高度特性的默认控制规律都是 **涡轮前总温 \(T_4\) 不变**（取海平面静起飞设计点 \(W_f=3\) pps 的 \(T_4\)）。模型里燃油是常数、转速由牛顿法求出，所以每个飞行点会微调 \(W_f\) 去钉住 \(T_4\)。
+教材里三种稳态特性的分工：
+
+| 特性 | 冻结 | 扫描 | 默认工况 |
+|---|---|---|---|
+| 节流 | \(H=0\)、Ma = 0 | \(W_f\) | 地面静止 |
+| 高度 | 几何、Ma、\(T_4\) | 高度 | Ma = 0.9 |
+| 速度 | 几何、高度、\(T_4\) | Ma | \(H=0\) |
+
+三者都要求几何冻结、控制规律不变，只改表里那一项。推力一律用净推力 \(F_n=F_g-F_{\mathrm{ram}}\)。
+
+本例默认控制规律是 **涡轮前总温 \(T_4\) 不变**，钉住的是**海平面静止设计点**（\(H=0\)、Ma = 0、\(W_f=3\) pps）算出来的那个 \(T_4\)（约 1710 K / 3078 R），不随高度或马赫改写目标。不要把日志里的 `T4=3078` 当成开尔文。
+
+T-MATS 稳态模型里燃油是常数输入，牛顿未知数是 \([W,\; R\text{-line},\; \text{涡轮}PR,\; N]\)。所以每个飞行点有两层：
+
+1. **内层**：给定 \(W_f\)，牛顿法配平稳态。
+2. **外层**：改 \(W_f\)，直到 \(T_4\) 落到容差内。
+
+仍可改成钉住换算转速或物理转速（不是教材默认）：
+
+```matlab
+results = run_altitude_char('ThrottleMode', 'NcMap');  % NcMap = 1
+results = run_speed_char('ThrottleMode', 'N');         % N = 10000 rpm
+```
+
+温度单位：气路总温、静温用**兰氏度 R**（英制绝对温标，R = °F + 459.67）。模型入口 `dTamb [degF]` 只是相对标准大气的**温差**，扫描脚本保持 `dTamb = 0`（标准日）。
 
 ## 高度特性
 
-`run_altitude_char.m` 在 **几何冻结、Ma 固定、\(T_4\) 不变** 下扫高度。默认先在海平面按 **0.1** 把马赫数从 0 升到 0.9 并配平（不记入曲线），再扫高度。图上用**净推力** \(F_n=F_g-F_{\mathrm{ram}}\)（教材定义），不是喷管毛推力。四张子图为：单位推力 \(F_s=F_n/W\)、净推力 \(F_n\)、空气流量 \(W\)、耗油率 \(\mathrm{SFC}=3600 W_f/F_n\)。另存一张 **压气机换算转速 \(N_{c,\mathrm{map}}\) 随高度**。Ma = 0.9 时冲压阻力不可忽略：若误用 \(F_g\) 算 SFC，对流层内会随高度上升，与教材相反。
+`run_altitude_char.m`：**几何冻结、马赫数固定、\(T_4\) 不变，只扫高度。**
 
-本机压气机图 \(N_{c,\mathrm{map}}\) 只到 1.05。\(T_4\) 不变爬高时换算转速升高，出图即停止，**不按最高转速线外延**去强行扫到 11 km。
+### 默认算什么
 
-```matlab
-results = run_altitude_char;
-```
+| 量 | 默认 |
+|---|---|
+| 飞行马赫数 | 0.9（飞行高度特性） |
+| 控制规律 | \(T_4\) = 设计点值，外层容差 20 R |
+| 高度 | 0 km 起，名义步长 1 km，最小步长 0.25 km，目标上限 15 km |
+| 燃油上限 | 4 pps |
+| 大气 | 标准大气，`dTamb = 0` |
+| 推力 | 净推力 \(F_n=F_g-F_{\mathrm{ram}}\) |
 
-默认 Ma = 0.9、\(T_4\) 保持设计点。海平面静止高度特性：
+静止高度特性（Ma = 0）用：
 
 ```matlab
 results = run_altitude_char('MN', 0);
 ```
 
-若要改成钉住换算转速或物理转速（不是教材默认）：
+### 计算步骤
+
+1. 海平面静止、\(W_f=3\) pps，记下设计点 \(T_4\)。
+2. 若目标 Ma > 0：在 **H = 0** 按 0.1 把马赫从 0 升到 0.9，每档配平 \(T_4\)。这是牛顿延拓，**不记入高度曲线**。
+3. 从 H = 0、Ma = 0.9 起按 1 km 往上扫。失败则对分；出压气机图（\(N_{c,\mathrm{map}}\) 超出 0.50～1.05）即停，**不按最高转速线外延**。
+
+等 \(T_4\) 爬高时进口变冷，换算转速升高。本机图只到 1.05，Ma = 0.9 时大约在对流层顶以下就会出图，扫不到 11 km 是图的范围，不是大气在 11 km 截断。
+
+### 图与结果
+
+四张子图（横轴高度 km）：单位推力 \(F_s=F_n/W\)、净推力 \(F_n\)、空气流量 \(W\)、耗油率 \(\mathrm{SFC}=3600 W_f/F_n\)。另存 \(N_{c,\mathrm{map}}\) 随高度（纵轴为特性图 0.50～1.05）。
+
+Ma = 0.9 时冲压阻力不可忽略：若误用毛推力 \(F_g\) 算 SFC，对流层内会随高度上升，与教材相反。
 
 ```matlab
-results = run_altitude_char('ThrottleMode', 'NcMap');  % NcMap = 1
-results = run_altitude_char('ThrottleMode', 'N');      % N = 10000 rpm
+results = run_altitude_char;
+results = run_altitude_char('PlotOnly', true);  % 只重画
 ```
 
-钉死物理转速时，高空变冷后换算转速升高，本机压气机图大约只到 1.05，往往扫不高。
+覆盖写入 `altitude_char_results.mat`、`altitude_char.png` / `.fig`、`altitude_char_ncmap.png` / `.fig`。MATLAB 里请打开 **`.fig`**。
 
-结果覆盖写入 `altitude_char_results.mat`、`altitude_char.png` / `.fig`、`altitude_char_ncmap.png` / `.fig`。只重画：
-
-```matlab
-results = run_altitude_char('PlotOnly', true);
-```
+常用参数：`'MN'`、`'dMN'`（海平面加速步长，默认 0.1）、`'HMaxKm'`、`'dHKm'`、`'dHMinKm'`、`'WfMax'`、`'ThrottleMode'`。
 
 ## 速度特性
 
-`run_speed_char.m` 在 **几何冻结、高度固定、\(T_4\) 不变** 下扫马赫数。默认步长 **0.05**，Ma 从 0 扫到 **2.5**。图同样用净推力：\(F_s\)、\(F_n\)、\(W\)、SFC，横轴为 Ma。净推力 \(F_n=F_g-W V_0/g_c\)（教材冲压阻力）。超出压气机图转速范围或燃油上限即停止，不外延。
+`run_speed_char.m`：**几何冻结、高度固定、\(T_4\) 不变，只扫飞行马赫数。**
 
-```matlab
-results = run_speed_char;
-```
+### 默认算什么
 
-默认 H = 0 km，Ma 从 0 扫到 2.5。高空速度特性先在 Ma = 0 爬升到指定高度（不记入曲线），再扫 Ma：
+| 量 | 默认 |
+|---|---|
+| 高度 | 0 km（海平面速度特性） |
+| 控制规律 | \(T_4\) = 设计点值，外层容差 2 R |
+| 马赫数 | 0 起，步长 0.05，最小步长 0.025，上限 2.5 |
+| 燃油上限 | 8 pps |
+| 大气 | 标准大气，`dTamb = 0` |
+| 推力 | \(F_n=F_g-W V_0/g_c\) |
+
+高空速度特性先在 Ma = 0 爬到指定高度（不记入曲线），再扫 Ma：
 
 ```matlab
 results = run_speed_char('HKm', 11);
 ```
 
-结果覆盖写入 `speed_char_results.mat`、`speed_char.png` / `.fig`。只重画：
+### 计算步骤
+
+1. 海平面静止、\(W_f=3\) pps，记下设计点 \(T_4\)。
+2. 若 `HKm > 0`：Ma = 0 爬高并配平 \(T_4\)（不画进速度曲线）。
+3. 在该高度上从 Ma = 0 按 0.05 往上扫。每档用冲压总压比放大 \(W\)、\(W_f\) 初值，再内层牛顿、外层钉 \(T_4\)。失败则对分；出图或燃油顶格则停止。
+
+节流特性不需要这种流量放缩：进口条件不变，只改油门，上一档收敛解即可当牛顿初值。
+
+### 曲线怎么读
+
+\(F_n = F_s \cdot W\)。等 \(T_4\) 时：
+
+- **\(F_s\)** 随马赫大致单调下降，很高马赫时趋向 0。
+- **\(W\)** 随冲压增大。
+- **\(F_n\)** 因此常为：先降（冲压阻力先露头）→ 再升（流量涨得比 \(F_s\) 掉得快）→ 过峰值后再降。降到 0 要 \(F_s\to 0\)，往往高于本机图能算到的马赫。
+
+本机压气机图 \(N_{c,\mathrm{map}}\) 为 0.50～1.05。马赫升高进口变热，换算转速下降，可能先碰到图的下沿或燃油上限（默认 `WfMax = 8` pps），不一定真能扫到 2.5。
+
+纵轴按数据自动缩放。相邻点 \(F_n\) 差千分之几，多半是 \(T_4\) 配平残差或特性图插值，不是趋势反转。
+
+### 图与结果
+
+四张子图（横轴 Ma）：\(F_s\)、\(F_n\)、\(W\)、SFC。
 
 ```matlab
-results = run_speed_char('PlotOnly', true);
+results = run_speed_char;
+results = run_speed_char('PlotOnly', true);  % 只重画
 ```
+
+覆盖写入 `speed_char_results.mat`、`speed_char.png` / `.fig`。MATLAB 里请打开 **`.fig`**。
+
+常用参数：`'HKm'`、`'MNMax'`（默认 2.5）、`'dMN'`（默认 0.05）、`'dMNMin'`、`'WfMax'`、`'ThrottleMode'`。
 
 ## 目录
 
